@@ -1,0 +1,89 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=1.15cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=blue!70!black,
+    urlcolor=blue!70!black
+}
+
+\title{\vspace{-2.8em}\textbf{\large Physics-Informed LLM Latency Prediction:}\\[0.1em]
+\large Critical Analysis of the Analytical Roofline Model vs. Direct Operational Modeling}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\vspace{-4.2em}
+
+\section*{Pre-Execution Scheduling \& The Token Count Prerequisite}
+In production LLM serving, latency predictors must operate \textbf{strictly before execution} using pre-launch parameters: cluster parallelism (\texttt{tp}, \texttt{pp}, \texttt{dp}, \texttt{num\_gpus}) and request budgets (\texttt{batch\_size}, \texttt{output\_tokens}). Post-execution telemetry (measured duration, energy, power) is strictly excluded.
+
+\vspace{-0.3em}
+\noindent \textbf{The Token Prerequisite (Imai et al., Section A.4)}: The analytical Roofline Model (RLM) calculates hardware ceilings from input and output tokens:
+\begin{equation}
+    T_{\text{roofline}} = T_{\text{prefill}}(\text{input\_tokens}) + \text{output\_tokens} \times T_{\text{decode\_step}}(\text{batch\_size})
+\end{equation}
+While prompt token count is known pre-execution via fast tokenization, output length is dynamic. As acknowledged by Imai et al. (Appendix A.4, \textit{Limitation}): \textit{``In practical application, the generation length is not predetermined... To accurately model inference latency in real world scenarios, we must consider predicting the generation length based on the input prompt.''}
+
+\vspace{0.1em}
+\noindent \textbf{Core Thesis Critique: Is RLM Calculation Necessary If Tokens Are Known?}:
+\begin{itemize}
+    \setlength\itemsep{0.04em}
+    \item \textbf{When Token / Task Context is Known (RLM is Redundant)}: If token counts or task context are known prior to execution, our evaluations demonstrate that \textbf{calculating the analytical Roofline model is empirically unnecessary}. Standard tree ensembles (RF/GB) trained directly on operational parameters already reach near-perfect accuracy (\textbf{$R^2 = 0.9997$}), with RLM adding \textbf{$+0.0\%$ improvement}. Non-linear models easily learn hardware scaling directly from empirical data without manual hardware profiling.
+    \item \textbf{When Prompt Context is Omitted (RLM Acts as a Surrogate)}: If prompt context is omitted (e.g., privacy/zero-data retention prevents payload inspection), naive ML collapses ($R^2 \approx 0.25$). Here, RLM serves as a vital physics proxy, leaping RF accuracy to \textbf{$0.9997$} (\textbf{+74.4\% gain}, \textbf{99.96\% MSE reduction}).
+\end{itemize}
+
+\vspace{-0.7em}
+\begin{table}[htbp]
+\centering
+\small
+\renewcommand{\arraystretch}{0.86}
+\caption{Cross-Validation on Qwen3-14B: Known Operational Features vs. Roofline-Enhanced Regimes.}
+\label{tab:takeaway}
+\begin{tabular}{l cccc c}
+\toprule
+\textbf{Prediction Method} & \textbf{Base $R^2$} & \textbf{Base MSE} & \textbf{RLM $R^2$} & \textbf{RLM MSE} & \textbf{$R^2$ Gain ($\Delta$)} \\
+\midrule
+\multicolumn{6}{l}{\textit{\textbf{Regime 1: Omitted Prompt Context (Parallelism Known, Prompt Unknown) --- Roofline is Vital}}} \\
+Linear Regression (LR)          & 0.3005 & 224573.9 & \textbf{0.8844} & \textbf{37920.9} & \textbf{+58.4\%} \\
+Random Forest (RF)              & 0.2553 & 236925.7 & \textbf{0.9997} & \textbf{87.8}    & \textbf{+74.4\%} \\
+Gradient Boosting (GB)          & 0.2494 & 238558.9 & \textbf{0.9995} & \textbf{163.7}   & \textbf{+75.0\%} \\
+\midrule
+\multicolumn{6}{l}{\textit{\textbf{Regime 2: Known Token / Task Context (Direct Operational Modeling) --- Roofline is Redundant for Trees}}} \\
+Linear Regression (LR)          & 0.7879 & 69037.9  & \textbf{0.8882} & \textbf{36782.7} & \textbf{+10.0\%} \\
+Random Forest (RF)              & \textbf{0.9997} & 86.5     & \textbf{0.9997} & 87.8     & \textbf{+0.0\%} \\
+Gradient Boosting (GB)          & \textbf{0.9997} & 113.8    & \textbf{0.9997} & 163.7    & \textbf{+0.0\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{-1.2em}
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.70\textwidth]{figures/roofline_task_omission_impact.png}
+\vspace{-0.7em}
+\caption{\textbf{(A)} $R^2$ comparison: Naive models fail without prompt context; Roofline restores accuracy. \textbf{(B)} Predicted vs. Actual latency: With Roofline, predictions align perfectly with ground-truth latency.}
+\label{fig:takeaway}
+\end{figure}
+
+\vspace{-1.2em}
+\section*{Key Conclusions \& Need for Broader Empirical Validation}
+\begin{itemize}
+    \setlength\itemsep{0.02em}
+    \item \textbf{Direct Operational Modeling Suffices}: When pre-execution token counts are available, direct empirical regression on operational parameters achieves optimal accuracy ($R^2 = 0.9997$), rendering complex Roofline modeling redundant.
+    \item \textbf{Niche for RLM}: The Roofline model is justified primarily when restricted to linear models (LR) or when prompt context is inaccessible.
+    \item \textbf{Scope \& Future Validation}: To conclusively prove this thesis across production environments, broader testing is required across \textbf{additional model architectures} (e.g., Mixture-of-Experts MoE, 70B+ scales) and \textbf{diverse real-world datasets} (e.g., dynamic multi-turn chats, arbitrary RAG prompt lengths), beyond fixed benchmark grids.
+\end{itemize}
+
+\end{document}
