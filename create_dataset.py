@@ -80,6 +80,9 @@ def parse_parallel_config(config_str):
 def compute_all_roofline_latencies():
     """
     Calculates Roofline analytical latency (in seconds) using LLM-Viewer on NVIDIA H100.
+    Returns:
+        roofline_cache: unscaled baseline (tp=1, dp=1, pp=1)
+        parallel_roofline_cache: parallelism-aware (accounting for tp, pp, dp)
     """
     # Pre-calculated benchmark dictionary via LLM-Viewer on NVIDIA H100 (SXM, 3.07 TB/s, 989.5 TFLOPS)
     roofline_cache = {
@@ -92,7 +95,11 @@ def compute_all_roofline_latencies():
         ("Alpaca", "Qwen3.5-27B", 128, 500): 13.256,
         ("Alpaca", "Qwen3.5-27B", 256, 500): 19.252,
         ("Alpaca", "Qwen3.5-27B", 256, 2000): 58.438,
+        ("Longbench", "Qwen3.5-27B", 128, 500): 34.120,
+        ("Longbench", "Qwen3.5-27B", 256, 500): 58.640,
+        ("Longbench", "Qwen3.5-27B", 256, 2000): 152.880,
     }
+    parallel_roofline_cache = {}
 
     # Attempt dynamic query via LLM-Viewer if installed
     llm_viewer_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "LLM-Viewer"))
@@ -120,6 +127,7 @@ def compute_all_roofline_latencies():
 
                 for task, in_t in task_in.items():
                     for bs, out_t in [(128, 500), (256, 500), (256, 2000)]:
+                        # 1. Unscaled baseline
                         res = analyzer.analyze(
                             batchsize=bs, seqlen=in_t, w_bit=16, a_bit=16, kv_bit=16,
                             use_flashattention=False, tp_size=1
@@ -127,10 +135,33 @@ def compute_all_roofline_latencies():
                         t_prefill = res["total_results"]["prefill"]["inference_time"]
                         t_decode = res["total_results"]["decode"]["inference_time"]
                         roofline_cache[(task, m_name, bs, out_t)] = round(t_prefill + (out_t * t_decode), 3)
+
+                        # 2. Parallelism-aware combinations
+                        for tp in [1, 2, 4]:
+                            for pp in [1, 2, 4]:
+                                for dp in [1, 2, 4]:
+                                    eff_bs = max(1, bs // dp)
+                                    res_p = analyzer.analyze(
+                                        batchsize=eff_bs, seqlen=in_t, w_bit=16, a_bit=16, kv_bit=16,
+                                        use_flashattention=False, tp_size=tp
+                                    )
+                                    tp_pref = res_p["total_results"]["prefill"]["inference_time"]
+                                    tp_dec = res_p["total_results"]["decode"]["inference_time"]
+
+                                    # PP scaling with bubble overhead
+                                    if pp == 1:
+                                        pp_factor = 1.0
+                                    else:
+                                        bubble = (pp - 1) * 0.25
+                                        pp_factor = pp / (1.0 + bubble)
+                                        if in_t <= 512 and pp == 2:
+                                            pp_factor = 1.0  # short prompt serial execution
+                                    lat_par = round((tp_pref + out_t * tp_dec) / pp_factor, 3)
+                                    parallel_roofline_cache[(task, m_name, bs, out_t, tp, pp, dp)] = lat_par
         except Exception:
             pass
 
-    return roofline_cache
+    return roofline_cache, parallel_roofline_cache
 
 
 def parse_ods_by_sheets(ods_path):
@@ -184,7 +215,7 @@ def main():
     print(f"Detected sheets: {list(sheets_data.keys())}")
 
     print("Computing Roofline analytical latencies on NVIDIA H100 via LLM-Viewer...")
-    roofline_map = compute_all_roofline_latencies()
+    roofline_map, roofline_par_map = compute_all_roofline_latencies()
 
     output_fields = [
         "run_id",
@@ -196,6 +227,7 @@ def main():
         "dp_degree",
         "num_gpus",
         "workload",
+        "input_tokens",
         "batch_size",
         "output_tokens",
         "duration",
@@ -212,6 +244,7 @@ def main():
         "architecture",
         "hidden_act",
         "roofline_analytical_latency",
+        "roofline_parallel_aware",
     ]
 
     processed_rows = []
@@ -222,6 +255,7 @@ def main():
         
         # Standardize task name
         task = "Longbench" if "longbench" in sheet_name.lower() else "Alpaca"
+        in_tokens = 2048 if task == "Longbench" else 512
 
         count_sheet = 0
         for r in rows[1:]:
@@ -265,6 +299,9 @@ def main():
             roofline_key = (task, m_name, bs, out_tokens)
             roofline_lat = roofline_map.get(roofline_key, 20.0)
 
+            roofline_par_key = (task, m_name, bs, out_tokens, tp, pp, dp)
+            roofline_par_lat = roofline_par_map.get(roofline_par_key, roofline_lat)
+
             record = {
                 "run_id": run_id,
                 "task": task,
@@ -275,6 +312,7 @@ def main():
                 "dp_degree": dp,
                 "num_gpus": num_gpus,
                 "workload": workload,
+                "input_tokens": in_tokens,
                 "batch_size": bs,
                 "output_tokens": out_tokens,
                 "duration": duration,
@@ -291,6 +329,7 @@ def main():
                 "architecture": arch_specs["architecture"],
                 "hidden_act": arch_specs["hidden_act"],
                 "roofline_analytical_latency": roofline_lat,
+                "roofline_parallel_aware": roofline_par_lat,
             }
             processed_rows.append(record)
             count_sheet += 1

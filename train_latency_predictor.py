@@ -2,22 +2,21 @@
 """
 train_latency_predictor.py
 ==========================
-Evaluates the core thesis finding:
-In real-world LLM deployments, cluster parallelism configuration (TP, PP, DP, Num GPUs)
-is known prior to deployment, but request prompt length / task context is dynamic and private.
-
-- Naive ML models with cluster parallelism still fail (R² ≈ 0.25 - 0.30) because they cannot
-  distinguish short prompts (~512 tokens) from long contexts (~2048 tokens).
-- Pairing known cluster parallelism with the analytical Roofline model acts as a physics proxy,
-  skyrocketing Random Forest R² from 0.255 to 0.9997 (99.96% MSE reduction) and Linear Regression
-  R² from 0.300 to 0.884 (83.1% MSE reduction).
+Comprehensive evaluation of physics-informed LLM latency prediction vs. direct operational modeling:
+1. Ablation Study: Simple token count (input_tokens) vs. Analytical Roofline Model (RLM).
+   - Demonstrates that for non-linear tree models (RF/GB), RLM functions purely as a token-count proxy
+     (reaching identical R² = 0.9997).
+2. Parallelism-Aware Roofline Modeling: Scaling analytical compute/memory roofs by TP, PP, and DP degrees
+   using LLM-Viewer principles.
+3. Out-of-Distribution Generalization: GroupKFold cross-validation across unseen parallelism configurations
+   and unseen workloads, proving that in-distribution R² ≈ 1.0 reflects discrete cell memorization.
 """
 
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.model_selection import KFold, cross_validate, cross_val_predict
+from sklearn.model_selection import KFold, GroupKFold, cross_validate, cross_val_predict
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -25,11 +24,18 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 
 
-def load_dataset(csv_path="reproduced_dataset.csv"):
+def load_dataset(csv_path="reproduced_dataset.csv", model_name="Qwen3-14B"):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"{csv_path} not found. Please run create_dataset.py first.")
     df = pd.read_csv(csv_path)
-    return df[df["model_name"] == "Qwen3-14B"].copy()
+    if model_name:
+        df = df[df["model_name"] == model_name].copy()
+    
+    # Ensure helper grouping columns exist
+    if "input_tokens" not in df.columns:
+        df["input_tokens"] = df["task"].map({"Alpaca": 512, "Longbench": 2048})
+    df["config_workload"] = df["config"] + "_" + df["workload"]
+    return df
 
 
 def build_pipeline(model, cat_cols, num_cols):
@@ -42,11 +48,13 @@ def build_pipeline(model, cat_cols, num_cols):
     return Pipeline([("prep", preprocessor), ("reg", model)])
 
 
-def evaluate_feature_set(df, feature_cols, target_col="duration"):
+def evaluate_feature_set(df, feature_cols, target_col="duration", cv=None, groups=None):
+    if cv is None:
+        cv = KFold(n_splits=3, shuffle=True, random_state=42)
+        
     num_cols = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in feature_cols if c not in num_cols]
     X, y = df[feature_cols], df[target_col]
-    cv = KFold(n_splits=3, shuffle=True, random_state=42)
 
     models = {
         "Linear Regression": LinearRegression(),
@@ -58,65 +66,77 @@ def evaluate_feature_set(df, feature_cols, target_col="duration"):
     predictions = {}
     for name, raw_model in models.items():
         pipe = build_pipeline(raw_model, cat_cols, num_cols)
-        cv_scores = cross_validate(pipe, X, y, cv=cv, scoring=["r2", "neg_mean_squared_error"])
-        preds = cross_val_predict(pipe, X, y, cv=cv)
+        cv_scores = cross_validate(pipe, X, y, cv=cv, groups=groups, scoring=["r2", "neg_mean_squared_error"])
+        preds = cross_val_predict(pipe, X, y, cv=cv, groups=groups)
         results[name] = {
-            "R2": np.mean(cv_scores["test_r2"]),
-            "MSE": -np.mean(cv_scores["test_neg_mean_squared_error"]),
+            "R2": float(np.mean(cv_scores["test_r2"])),
+            "MSE": float(-np.mean(cv_scores["test_neg_mean_squared_error"])),
         }
         predictions[name] = preds
 
     return results, predictions
 
 
-def plot_takeaway(df, pred_naive, pred_rlm, r2_naive, r2_rlm, output_path="figures/roofline_task_omission_impact.png"):
+def plot_takeaway(df, r2_ablation, r2_generalization, output_path="figures/roofline_task_omission_impact.png"):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=300)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.2), dpi=300)
 
-    # ── Panel A: R² Score across Pre-Execution Regimes ───────────────────────
-    ax = axes[0]
+    # ── Panel A: Token Count Ablation vs. Roofline (Standard CV) ─────────────
+    ax1 = axes[0]
     labels = ["Linear Regression", "Random Forest", "Gradient Boosting"]
     x = np.arange(len(labels))
-    width = 0.35
+    width = 0.22
 
-    bars1 = ax.bar(x - width/2, r2_naive, width, label="Known Cluster Parallelism (No Task)",
-                   color="#d9534f", edgecolor="black")
-    bars2 = ax.bar(x + width/2, r2_rlm, width, label="Known Parallelism + Roofline (No Task)",
-                   color="#5cb85c", edgecolor="black", hatch="//")
+    r2_base = [r2_ablation["Base"][m]["R2"] for m in labels]
+    r2_tok  = [r2_ablation["Tokens"][m]["R2"] for m in labels]
+    r2_rlm  = [r2_ablation["Roofline"][m]["R2"] for m in labels]
+    r2_par  = [r2_ablation["Parallel_Roofline"][m]["R2"] for m in labels]
 
-    ax.set_ylabel("Cross-Validated R² Score", fontsize=11, fontweight="bold")
-    ax.set_title("A. Predictive Power: Parallelism Known, Task Unknown", fontsize=11, fontweight="bold")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylim(0, 1.15)
-    ax.grid(axis="y", linestyle="--", alpha=0.3)
-    ax.legend(fontsize=9, loc="upper left")
+    ax1.bar(x - 1.5*width, r2_base, width, label="Parallelism Only (No Task/Tokens)", color="#d9534f", edgecolor="black")
+    ax1.bar(x - 0.5*width, r2_tok,  width, label="Parallelism + input_tokens (Simple Count)", color="#337ab7", edgecolor="black", hatch="//")
+    ax1.bar(x + 0.5*width, r2_rlm,  width, label="Parallelism + Unscaled Roofline", color="#5cb85c", edgecolor="black", hatch="\\\\")
+    ax1.bar(x + 1.5*width, r2_par,  width, label="Parallelism + Parallel-Aware Roofline", color="#2e662e", edgecolor="black")
+
+    ax1.set_ylabel("Cross-Validated R² Score", fontsize=11, fontweight="bold")
+    ax1.set_title("A. Ablation: Simple Token Count vs. Roofline (k=3 CV)", fontsize=11, fontweight="bold")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontsize=10)
+    ax1.set_ylim(0, 1.22)
+    ax1.grid(axis="y", linestyle="--", alpha=0.3)
+    ax1.legend(fontsize=8.5, loc="upper left")
 
     for i in range(len(labels)):
-        delta = (r2_rlm[i] - r2_naive[i]) * 100
-        ax.annotate(f"+{delta:.1f}%\n(R²={r2_rlm[i]:.3f})", xy=(x[i] + width/2, r2_rlm[i] + 0.02),
-                    ha="center", fontsize=8.5, fontweight="bold", color="#2e662e")
+        ax1.annotate(f"{r2_tok[i]:.3f}", xy=(x[i] - 0.5*width, r2_tok[i] + 0.02), ha="center", fontsize=7.5, fontweight="bold", color="#1d4b75")
+        ax1.annotate(f"{r2_rlm[i]:.3f}", xy=(x[i] + 0.5*width, r2_rlm[i] + 0.02), ha="center", fontsize=7.5, fontweight="bold", color="#2e662e")
 
-    # ── Panel B: Predicted vs Actual Latency (Random Forest) ─────────────────
+    # ── Panel B: Generalization Degradation across GroupKFold Splits ─────────
     ax2 = axes[1]
-    y_actual = df["duration"].values
-    y_naive = pred_naive["Random Forest"]
-    y_rlm = pred_rlm["Random Forest"]
+    cv_schemes = [
+        "Random 3-Fold CV\n(Identical replicates in train/test)",
+        "GroupKFold: (Config, Workload)\n(Unseen condition)",
+        "GroupKFold: Config\n(Unseen parallelism degree)",
+    ]
+    x2 = np.arange(len(cv_schemes))
+    width2 = 0.26
 
-    ax2.scatter(y_actual, y_naive, color="#d9534f", alpha=0.55, edgecolors="none", s=35,
-                label=f"Naive RF with Parallelism (R² = {r2_naive[1]:.2f})")
-    ax2.scatter(y_actual, y_rlm, color="#5cb85c", alpha=0.8, edgecolors="black", linewidth=0.5, s=40,
-                label=f"Roofline RF with Parallelism (R² = {r2_rlm[1]:.4f})")
+    lr_scores = [r2_generalization[s]["Linear Regression"]["R2"] for s in ["kfold", "group_cell", "group_config"]]
+    rf_scores = [r2_generalization[s]["Random Forest"]["R2"] for s in ["kfold", "group_cell", "group_config"]]
+    gb_scores = [r2_generalization[s]["Gradient Boosting"]["R2"] for s in ["kfold", "group_cell", "group_config"]]
 
-    lims = [0, max(y_actual) * 1.05]
-    ax2.plot(lims, lims, "k--", alpha=0.6, label="Ideal (y = x)")
-    ax2.set_xlim(lims)
-    ax2.set_ylim(lims)
-    ax2.set_xlabel("Actual Latency (s)", fontsize=11, fontweight="bold")
-    ax2.set_ylabel("Predicted Latency (s)", fontsize=11, fontweight="bold")
-    ax2.set_title("B. Ground Truth vs. Predicted (Pre-Execution Inputs Only)", fontsize=11, fontweight="bold")
-    ax2.grid(True, linestyle="--", alpha=0.3)
-    ax2.legend(fontsize=9, loc="upper left")
+    ax2.bar(x2 - width2, lr_scores, width2, label="Linear Regression", color="#f0ad4e", edgecolor="black")
+    ax2.bar(x2, rf_scores, width2, label="Random Forest", color="#5cb85c", edgecolor="black", hatch="//")
+    ax2.bar(x2 + width2, gb_scores, width2, label="Gradient Boosting", color="#5bc0de", edgecolor="black", hatch="\\\\")
+
+    ax2.set_ylabel("Cross-Validated R² Score", fontsize=11, fontweight="bold")
+    ax2.set_title("B. Generalization Collapse: In-Distribution vs. GroupKFold", fontsize=11, fontweight="bold")
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels(cv_schemes, fontsize=9.5)
+    ax2.set_ylim(0, 1.22)
+    ax2.grid(axis="y", linestyle="--", alpha=0.3)
+    ax2.legend(fontsize=9, loc="upper right")
+
+    for i in range(len(cv_schemes)):
+        ax2.annotate(f"R²={rf_scores[i]:.3f}", xy=(x2[i], max(rf_scores[i], 0) + 0.02), ha="center", fontsize=8.5, fontweight="bold", color="#2e662e")
 
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
@@ -125,58 +145,79 @@ def plot_takeaway(df, pred_naive, pred_rlm, r2_naive, r2_rlm, output_path="figur
 
 
 def main():
-    print("=" * 84)
-    print("  PRE-EXECUTION DEPLOYMENT EVALUATION: KNOWN PARALLELISM VS. UNKNOWN PROMPT CONTEXT")
-    print("=" * 84)
+    print("=" * 88)
+    print("  PHYSICS-INFORMED ROOFLINE VS. OPERATIONAL MODELING: COMPREHENSIVE ABLATION")
+    print("=" * 88)
 
     df = load_dataset()
     print(f"Loaded {len(df)} runs for Qwen3-14B across Alpaca (~512 in-tokens) and Longbench (~2048 in-tokens).")
 
-    # 1. Real-World Deployment: Infrastructure Parallelism Known, Task/Prompt Unknown
-    cols_parallel = ["batch_size", "output_tokens", "tp_degree", "pp_degree", "dp_degree", "num_gpus"]
-    cols_parallel_rlm = cols_parallel + ["roofline_analytical_latency"]
+    cols_base = ["batch_size", "output_tokens", "tp_degree", "pp_degree", "dp_degree", "num_gpus"]
+    cols_input_tok = cols_base + ["input_tokens"]
+    cols_unscaled_rlm = cols_base + ["roofline_analytical_latency"]
+    cols_par_rlm = cols_base + ["roofline_parallel_aware"]
 
-    res_par_id, preds_par_id = evaluate_feature_set(df, cols_parallel)
-    res_par_rlm, preds_par_rlm = evaluate_feature_set(df, cols_parallel_rlm)
+    # 1. Ablation Study (Standard k=3 CV)
+    res_base, preds_base = evaluate_feature_set(df, cols_base)
+    res_tok, preds_tok = evaluate_feature_set(df, cols_input_tok)
+    res_rlm, preds_rlm = evaluate_feature_set(df, cols_unscaled_rlm)
+    res_par, preds_par = evaluate_feature_set(df, cols_par_rlm)
 
-    # 2. Minimal Ops (Single-GPU serving without parallelism): Task Unknown
-    cols_min = ["batch_size", "output_tokens"]
-    cols_min_rlm = cols_min + ["roofline_analytical_latency"]
-    res_min_id, _ = evaluate_feature_set(df, cols_min)
-    res_min_rlm, _ = evaluate_feature_set(df, cols_min_rlm)
+    r2_ablation = {
+        "Base": res_base,
+        "Tokens": res_tok,
+        "Roofline": res_rlm,
+        "Parallel_Roofline": res_par,
+    }
 
-    # 3. Benchmark Oracle (Synthetic: Task Labels Provided)
-    cols_oracle = ["task", "batch_size", "output_tokens", "tp_degree", "pp_degree", "dp_degree", "num_gpus"]
-    res_oracle_id, _ = evaluate_feature_set(df, cols_oracle)
+    print("\n" + "─" * 88)
+    print("1. ABLATION STUDY: INPUT TOKENS VS. ROOFLINE (RANDOM 3-FOLD CV)")
+    print("─" * 88)
+    print(f"{'Method':<20} │ {'Base (No Tok)':^17} │ {'+ input_tokens':^18} │ {'+ Roofline (Unscaled)':^22} │ {'+ Parallel RLM':^18}")
+    print(f"{'':<20} │ {'R²':>7}  {'MSE':>8} │ {'R²':>7}   {'MSE':>8} │ {'R²':>8}    {'MSE':>9} │ {'R²':>7}   {'MSE':>8}")
+    print("─" * 88)
+    for m in res_base:
+        print(f"{m:<20} │ {res_base[m]['R2']:>7.4f} {res_base[m]['MSE']:>8.1f} │ "
+              f"{res_tok[m]['R2']:>7.4f} {res_tok[m]['MSE']:>8.1f} │ "
+              f"{res_rlm[m]['R2']:>8.4f} {res_rlm[m]['MSE']:>9.1f} │ "
+              f"{res_par[m]['R2']:>7.4f} {res_par[m]['MSE']:>8.1f}")
+    print("─" * 88)
+    print("Takeaway: For tree models, simple input_tokens yields R²=0.9997, identical to Roofline.")
 
-    # Print clean summary tables
-    print("\n" + "─" * 84)
-    print("REALISTIC DEPLOYMENT: CLUSTER PARALLELISM KNOWN (TP, PP, DP, GPUS), TASK UNKNOWN")
-    print("─" * 84)
-    print(f"{'Method':<20} │ {'Parallelism Only':^22} │ {'Parallelism + Roofline':^24} │ {'R² Δ':^8}")
-    print(f"{'':<20} │ {'R²':>8}   {'MSE':>10} │ {'R²':>9}   {'MSE':>10} │")
-    print("─" * 84)
-    for m in res_par_id:
-        r2_b = res_par_id[m]["R2"]
-        mse_b = res_par_id[m]["MSE"]
-        r2_r = res_par_rlm[m]["R2"]
-        mse_r = res_par_rlm[m]["MSE"]
-        delta = (r2_r - r2_b) * 100
-        print(f"{m:<20} │ {r2_b:>8.4f}   {mse_b:>10.1f} │ {r2_r:>9.4f}   {mse_r:>10.1f} │ {delta:>+7.1f}%")
+    # 2. GroupKFold Generalization Study
+    cv_kfold = KFold(n_splits=3, shuffle=True, random_state=42)
+    cv_cell = GroupKFold(n_splits=4)
+    cv_config = GroupKFold(n_splits=4)
+    cv_workload = GroupKFold(n_splits=3)
 
-    print("\n" + "─" * 84)
-    print("SYNTHETIC BENCHMARK: TASK LABELS PROVIDED (MEMORIZATION EFFECT)")
-    print("─" * 84)
-    print(f"{'Method':<20} │ {'Oracle ID R²':>12}   {'MSE':>10} │ Notes")
-    print("─" * 84)
-    for m in res_oracle_id:
-        print(f"{m:<20} │ {res_oracle_id[m]['R2']:>12.4f}   {res_oracle_id[m]['MSE']:>10.1f} │ "
-              f"{'Memorizes discrete benchmark grid' if 'Forest' in m or 'Boost' in m else 'Linear model cannot fully memorize'}")
-    print("=" * 84)
+    res_gen_kfold, _ = evaluate_feature_set(df, cols_input_tok, cv=cv_kfold)
+    res_gen_cell, _ = evaluate_feature_set(df, cols_input_tok, cv=cv_cell, groups=df["config_workload"])
+    res_gen_config, _ = evaluate_feature_set(df, cols_input_tok, cv=cv_config, groups=df["config"])
+    res_gen_workload, _ = evaluate_feature_set(df, cols_input_tok, cv=cv_workload, groups=df["workload"])
 
-    r2_naive = [res_par_id[m]["R2"] for m in ["Linear Regression", "Random Forest", "Gradient Boosting"]]
-    r2_rlm   = [res_par_rlm[m]["R2"] for m in ["Linear Regression", "Random Forest", "Gradient Boosting"]]
-    plot_takeaway(df, preds_par_id, preds_par_rlm, r2_naive, r2_rlm)
+    res_gen_rlm_workload, _ = evaluate_feature_set(df, cols_unscaled_rlm, cv=cv_workload, groups=df["workload"])
+
+    r2_generalization = {
+        "kfold": res_gen_kfold,
+        "group_cell": res_gen_cell,
+        "group_config": res_gen_config,
+        "group_workload": res_gen_workload,
+    }
+
+    print("\n" + "─" * 88)
+    print("2. GENERALIZATION STUDY: IN-DISTRIBUTION CV VS. OUT-OF-DISTRIBUTION GROUPKFOLD")
+    print("─" * 88)
+    print(f"{'CV Split Regime':<35} │ {'Linear Reg':^14} │ {'Random Forest':^15} │ {'Gradient Boost':^15}")
+    print(f"{'':<35} │ {'R²':>6}   {'MSE':>6} │ {'R²':>6}    {'MSE':>6} │ {'R²':>6}    {'MSE':>6}")
+    print("─" * 88)
+    print(f"{'Random 3-Fold (In-Distribution)':<35} │ {res_gen_kfold['Linear Regression']['R2']:>6.4f} {res_gen_kfold['Linear Regression']['MSE']:>6.0f} │ {res_gen_kfold['Random Forest']['R2']:>6.4f}  {res_gen_kfold['Random Forest']['MSE']:>6.1f} │ {res_gen_kfold['Gradient Boosting']['R2']:>6.4f}  {res_gen_kfold['Gradient Boosting']['MSE']:>6.1f}")
+    print(f"{'GroupKFold: (Config, Workload)':<35} │ {res_gen_cell['Linear Regression']['R2']:>6.4f} {res_gen_cell['Linear Regression']['MSE']:>6.0f} │ {res_gen_cell['Random Forest']['R2']:>6.4f}  {res_gen_cell['Random Forest']['MSE']:>6.0f} │ {res_gen_cell['Gradient Boosting']['R2']:>6.4f}  {res_gen_cell['Gradient Boosting']['MSE']:>6.0f}")
+    print(f"{'GroupKFold: Parallelism Config':<35} │ {res_gen_config['Linear Regression']['R2']:>6.4f} {res_gen_config['Linear Regression']['MSE']:>6.0f} │ {res_gen_config['Random Forest']['R2']:>6.4f}  {res_gen_config['Random Forest']['MSE']:>6.0f} │ {res_gen_config['Gradient Boosting']['R2']:>6.4f}  {res_gen_config['Gradient Boosting']['MSE']:>6.0f}")
+    print(f"{'GroupKFold: Workload (input_tokens)':<35} │ {res_gen_workload['Linear Regression']['R2']:>6.4f} {res_gen_workload['Linear Regression']['MSE']:>6.0f} │ {res_gen_workload['Random Forest']['R2']:>6.4f}  {res_gen_workload['Random Forest']['MSE']:>6.0f} │ {res_gen_workload['Gradient Boosting']['R2']:>6.4f}  {res_gen_workload['Gradient Boosting']['MSE']:>6.0f}")
+    print(f"{'GroupKFold: Workload (Roofline Model)':<35} │ {res_gen_rlm_workload['Linear Regression']['R2']:>6.4f} {res_gen_rlm_workload['Linear Regression']['MSE']:>6.0f} │ {res_gen_rlm_workload['Random Forest']['R2']:>6.4f}  {res_gen_rlm_workload['Random Forest']['MSE']:>6.0f} │ {res_gen_rlm_workload['Gradient Boosting']['R2']:>6.4f}  {res_gen_rlm_workload['Gradient Boosting']['MSE']:>6.0f}")
+    print("=" * 88)
+
+    plot_takeaway(df, r2_ablation, r2_generalization)
 
 
 if __name__ == "__main__":

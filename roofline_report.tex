@@ -1,5 +1,5 @@
 \documentclass[10pt,a4paper]{article}
-\usepackage[margin=1.15cm]{geometry}
+\usepackage[margin=1.0cm]{geometry}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage{graphicx}
@@ -8,6 +8,14 @@
 \usepackage{amsmath}
 \usepackage{hyperref}
 \usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc}
+
+\definecolor{colcluster}{RGB}{0, 115, 120}
+\definecolor{colimai}{RGB}{20, 85, 170}
+\definecolor{colphys}{RGB}{125, 30, 140}
+\definecolor{boxbg}{RGB}{246, 248, 251}
+\definecolor{boxborder}{RGB}{185, 198, 212}
 
 \hypersetup{
     colorlinks=true,
@@ -27,63 +35,159 @@
 \vspace{-4.2em}
 
 \section*{Pre-Execution Scheduling \& The Token Count Prerequisite}
-In production LLM serving, latency predictors must operate \textbf{strictly before execution} using pre-launch parameters: cluster parallelism (\texttt{tp}, \texttt{pp}, \texttt{dp}, \texttt{num\_gpus}) and request budgets (\texttt{batch\_size}, \texttt{output\_tokens}). Post-execution telemetry (measured duration, energy, power) is strictly excluded.
+In production LLM serving, latency predictors must operate \textbf{strictly pre-execution} using launch configurations: cluster parallelism (\texttt{tp}, \texttt{pp}, \texttt{dp}, \texttt{num\_gpus}) and request budgets (\texttt{batch\_size}, \texttt{output\_tokens}). Post-execution telemetry is strictly excluded.
 
 \vspace{-0.3em}
 \noindent \textbf{The Token Prerequisite (Imai et al., Section A.4)}: The analytical Roofline Model (RLM) calculates hardware ceilings from input and output tokens:
 \begin{equation}
     T_{\text{roofline}} = T_{\text{prefill}}(\text{input\_tokens}) + \text{output\_tokens} \times T_{\text{decode\_step}}(\text{batch\_size})
 \end{equation}
-While prompt token count is known pre-execution via fast tokenization, output length is dynamic. As acknowledged by Imai et al. (Appendix A.4, \textit{Limitation}): \textit{``In practical application, the generation length is not predetermined... To accurately model inference latency in real world scenarios, we must consider predicting the generation length based on the input prompt.''}
+While prompt length is known pre-execution, output length is dynamic. As acknowledged by Imai et al. (Appendix A.4): \textit{``In practical application, the generation length is not predetermined... To accurately model inference latency in real world scenarios, we must consider predicting the generation length based on the input prompt.''}
 
 \vspace{0.1em}
-\noindent \textbf{Core Thesis Critique: Is RLM Calculation Necessary If Tokens Are Known?}:
+\noindent \textbf{Methodological Analysis: Single-Model Benchmark Artifact vs. Cross-Model Reality}:
 \begin{itemize}
-    \setlength\itemsep{0.04em}
-    \item \textbf{When Token / Task Context is Known (RLM is Redundant)}: If token counts or task context are known prior to execution, our evaluations demonstrate that \textbf{calculating the analytical Roofline model is empirically unnecessary}. Standard tree ensembles (RF/GB) trained directly on operational parameters already reach near-perfect accuracy (\textbf{$R^2 = 0.9997$}), with RLM adding \textbf{$+0.0\%$ improvement}. Non-linear models easily learn hardware scaling directly from empirical data without manual hardware profiling.
-    \item \textbf{When Prompt Context is Omitted (RLM Acts as a Surrogate)}: If prompt context is omitted (e.g., privacy/zero-data retention prevents payload inspection), naive ML collapses ($R^2 \approx 0.25$). Here, RLM serves as a vital physics proxy, leaping RF accuracy to \textbf{$0.9997$} (\textbf{+74.4\% gain}, \textbf{99.96\% MSE reduction}).
+    \setlength\itemsep{0.03em}
+    \item \textbf{The Single-Model Confound (Why Trees Treat RLM as Tokens)}: In a fixed-model benchmark (Qwen3-14B) evaluated over discrete prompt lengths (512 vs.~2048), model parameters ($N_{\text{params}}, d_{\text{model}}, L$) and hardware ceilings are constant. Consequently, the analytical roofline $T_{\text{roofline}}$ is a strictly monotonic mathematical transform of \texttt{input\_tokens}. Non-linear tree ensembles (RF/GB) split either feature identically, yielding an identical $R^2 = 0.9997$ (MSE $91.2$ vs.~$87.8$). Within this single-model grid, RLM adds no distinct predictive signal beyond a binary prompt indicator.
+    \item \textbf{Why the Roofline Model Is Essential Across Models}: In production serving across heterogeneous model families (e.g., 1.3B to 27B), a raw scalar \texttt{input\_tokens} carries \textbf{zero architectural context}---512 tokens induces orders-of-magnitude different compute/memory load on a 1.3B vs.~a 27B model. The analytical Roofline Model bridges this gap by grounding predictions in model FLOPs, tensor dimensions, and hardware bandwidth.
+    \item \textbf{Linear Inductive Prior}: For linear regressors that cannot learn non-linear decision boundaries, RLM provides a meaningful physical inductive bias, reducing MSE by 45\% ($69038 \to 37921$, $R^2 = 0.7879 \to 0.8844$) compared to raw token counts.
+    % \item \textbf{Parallelism Scaling}: Unscaled RLM assumes single-GPU SXM ceilings. Scaling analytical ceilings by TP, DP (partitioned batch $B/\text{DP}$), and PP degrees improves physical correlation ($r = 0.85 \to 0.94$) and lowers linear regression MSE from $37921$ to $32339$.
+    % \item \textbf{Generalization Collapse (GroupKFold)}: Near-perfect accuracy ($R^2 = 0.9997$) in standard CV is an artifact of discrete cell memorization (10 identical replicates per cell). Testing on unseen parallelism or conditions via \textbf{GroupKFold} drops accuracy to \textbf{$R^2 = 0.45 - 0.65$}. However, RLM provides a vital inductive bias when extrapolating to unseen sequence lengths where trees collapse ($R^2 = -0.26$).
 \end{itemize}
 
-\vspace{-0.7em}
+\vspace{-0.8em}
 \begin{table}[htbp]
 \centering
-\small
-\renewcommand{\arraystretch}{0.86}
-\caption{Cross-Validation on Qwen3-14B: Known Operational Features vs. Roofline-Enhanced Regimes.}
+\scriptsize
+\renewcommand{\arraystretch}{0.85}
+\setlength{\tabcolsep}{3.5pt}
+\caption{Qwen3-14B: Independent Feature Set Ablation on Standard 3-Fold Cross-Validation ($R^2$ / MSE). \\
+\textit{Base features: \texttt{[tp, pp, dp, num\_gpus, batch\_size, output\_tokens]}. Columns 3 and 4 add either \texttt{input\_tokens} OR \texttt{Unscaled RLM} independently to the Base set to evaluate their standalone predictive impact.}}
 \label{tab:takeaway}
-\begin{tabular}{l cccc c}
+\begin{tabular}{l ccc c}
 \toprule
-\textbf{Prediction Method} & \textbf{Base $R^2$} & \textbf{Base MSE} & \textbf{RLM $R^2$} & \textbf{RLM MSE} & \textbf{$R^2$ Gain ($\Delta$)} \\
+\textbf{Model / Estimator} & \textbf{Base (No Prompt Tok)} & \textbf{Base + input\_tokens} & \textbf{Base + Unscaled RLM} & \textbf{Key Takeaway} \\
 \midrule
-\multicolumn{6}{l}{\textit{\textbf{Regime 1: Omitted Prompt Context (Parallelism Known, Prompt Unknown) --- Roofline is Vital}}} \\
-Linear Regression (LR)          & 0.3005 & 224573.9 & \textbf{0.8844} & \textbf{37920.9} & \textbf{+58.4\%} \\
-Random Forest (RF)              & 0.2553 & 236925.7 & \textbf{0.9997} & \textbf{87.8}    & \textbf{+74.4\%} \\
-Gradient Boosting (GB)          & 0.2494 & 238558.9 & \textbf{0.9995} & \textbf{163.7}   & \textbf{+75.0\%} \\
-\midrule
-\multicolumn{6}{l}{\textit{\textbf{Regime 2: Known Token / Task Context (Direct Operational Modeling) --- Roofline is Redundant for Trees}}} \\
-Linear Regression (LR)          & 0.7879 & 69037.9  & \textbf{0.8882} & \textbf{36782.7} & \textbf{+10.0\%} \\
-Random Forest (RF)              & \textbf{0.9997} & 86.5     & \textbf{0.9997} & 87.8     & \textbf{+0.0\%} \\
-Gradient Boosting (GB)          & \textbf{0.9997} & 113.8    & \textbf{0.9997} & 163.7    & \textbf{+0.0\%} \\
+Linear Regression (LR)          & 0.3005 / 224574 & 0.7879 / 69038 & \textbf{0.8844 / 37921} & RLM aids linear fit \\
+Random Forest (RF)              & 0.2553 / 236926 & \textbf{0.9997 / 91.2}  & \textbf{0.9997 / 87.8}  & \textbf{Identical tree splits} \\
+Gradient Boosting (GB)          & 0.2494 / 238559 & \textbf{0.9997 / 113.8} & 0.9995 / 163.7 & \textbf{Identical tree splits} \\
+% \midrule
+% \multicolumn{5}{l}{\textit{\textbf{Part B: Generalization Degradation across GroupKFold Regimes (Random Forest $R^2$ / MSE)}}} \\
+% Standard 3-Fold (In-Distribution) & 0.2553 / 236926 & 0.9997 / 91.2  & 0.9997 / 87.8  & Discrete cell memorization \\
+% GroupKFold: (Config, Workload)    & 0.0797 / 264435 & 0.6481 / 106061 & 0.6354 / 110522 & Generalizes to new condition \\
+% GroupKFold: Parallelism Config   & -0.031 / 281116 & 0.4561 / 137257 & 0.4436 / 142060 & Generalizes to unseen degree \\
+% GroupKFold: Workload (LR Extrap.) & -0.658 / 391581 & -0.274 / 284794 & \textbf{+0.367 / 122258} & RLM enables extrapolation \\
+% Parallel-Aware RLM for LR: 0.8998 / 32339; RF: 0.9997 / 88.6; GB: 0.9997 / 96.7
 \bottomrule
 \end{tabular}
 \end{table}
 
-\vspace{-1.2em}
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=0.70\textwidth]{figures/roofline_task_omission_impact.png}
-\vspace{-0.7em}
-\caption{\textbf{(A)} $R^2$ comparison: Naive models fail without prompt context; Roofline restores accuracy. \textbf{(B)} Predicted vs. Actual latency: With Roofline, predictions align perfectly with ground-truth latency.}
-\label{fig:takeaway}
-\end{figure}
+% \begin{figure}[htbp]
+% \centering
+% \includegraphics[width=0.66\textwidth]{figures/roofline_task_omission_impact.png}
+% \vspace{-0.7em}
+% \caption{\textbf{(A)} Ablation: A simple token count matches Roofline accuracy on tree ensembles ($R^2=0.9997$). \textbf{(B)} Generalization collapse: In-distribution accuracy reflects discrete cell memorization; GroupKFold exposes realistic out-of-distribution performance.}
+% \label{fig:takeaway}
+% \end{figure}
 
-\vspace{-1.2em}
-\section*{Key Conclusions \& Need for Broader Empirical Validation}
+\vspace{-0.5em}
+\section*{Key Conclusions for Deployment \& Next Steps}
 \begin{itemize}
     \setlength\itemsep{0.02em}
-    \item \textbf{Direct Operational Modeling Suffices}: When pre-execution token counts are available, direct empirical regression on operational parameters achieves optimal accuracy ($R^2 = 0.9997$), rendering complex Roofline modeling redundant.
-    \item \textbf{Niche for RLM}: The Roofline model is justified primarily when restricted to linear models (LR) or when prompt context is inaccessible.
-    \item \textbf{Scope \& Future Validation}: To conclusively prove this thesis across production environments, broader testing is required across \textbf{additional model architectures} (e.g., Mixture-of-Experts MoE, 70B+ scales) and \textbf{diverse real-world datasets} (e.g., dynamic multi-turn chats, arbitrary RAG prompt lengths), beyond fixed benchmark grids.
+    \item \textbf{Single-Model Scope}: For isolated single-model deployments where prompt length is known pre-launch, empirical tree models achieve maximum accuracy using raw prompt tokens without analytical profiling.
+    \item \textbf{Cross-Model Serving}: The Roofline Model's primary value lies in cross-model and cross-hardware serving matrices, where physical parameter scaling ($O(\text{FLOPs})$, tensor sizes) is mandatory.
+    \item \textbf{Value for Linear Estimators}: RLM provides an effective inductive physics prior for linear estimators ($R^2 = 0.7879 \to 0.8844$, reducing MSE by 45\%).
+    % \item \textbf{Out-of-Distribution Generalization}: RLM provides inductive bias when extrapolating to unseen sequence lengths where purely empirical tree models collapse ($R^2 = -0.26 \to +0.37$).
+    \item \textbf{Experimental Next Steps}: Validate across continuous sequence lengths (dynamic RAG / chatbot traces) rather than fixed 2-point grids, and test multi-node scaling across 32B/70B architectures.
 \end{itemize}
 
+\clearpage
+
+\section*{\large Multi-GPU Benchmarking \& Replication Architecture: BSC MareNostrum 5 (MN5)}
+\vspace{-0.3em}
+\noindent \textbf{Execution Overview}: To empirically replicate and scale the Roofline-driven latency prediction methodology of Imai et al., benchmarks are conducted on the \textbf{Barcelona Supercomputing Center (BSC) MareNostrum 5 Accelerated Partition} (NVIDIA H100 SXM, 4 GPUs/node). The benchmark matrix combines the 4 original lightweight models (1.3B--2.7B) with 2 production-scale models (14B--27B) across both \textbf{vLLM} and \textbf{Triton Inference Server}, scaling from single-GPU up to 8 GPUs (2 nodes) under tensor, pipeline, and data parallelism.
+
+\vspace{-0.1em}
+\subsection*{1. Experimental Pipeline \& Execution Workflow}
+\vspace{-0.3em}
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.35cm and 0.4cm,
+    font=\scriptsize,
+    every node/.style={align=center},
+    stage/.style={rectangle, rounded corners=3pt, draw=boxborder, fill=boxbg, inner sep=4pt, line width=0.7pt, text width=2.55cm},
+    data/.style={rectangle, rounded corners=3pt, draw=colimai!80, fill=colimai!8, inner sep=4pt, line width=0.7pt, text width=2.55cm},
+    engine/.style={rectangle, rounded corners=3pt, draw=colcluster!80, fill=colcluster!8, inner sep=4pt, line width=0.7pt, text width=2.55cm},
+    phys/.style={rectangle, rounded corners=3pt, draw=colphys!80, fill=colphys!8, inner sep=4pt, line width=0.7pt, text width=2.55cm},
+    arrow/.style={-{Stealth[scale=0.85]}, line width=0.75pt, color=black!70}
+]
+    \node[stage] (env) {\textbf{1. HPC Environment}\\Apptainer / Singularity\\on BSC MN5 (H100 SXM)\\\textit{Pre-built SIF + offline weights}};
+    \node[data, right=of env] (models) {\textbf{2. Benchmark Matrix}\\4x Imai (1.3B--2.7B)\\+ 2x Qwen (14B--27B)\\\textit{1, 2, 4, 8 GPUs (1--2 nodes)}};
+    \node[engine, right=of models] (servers) {\textbf{3. Dual Inference Servers}\\vLLM vs. Triton-vLLM\\Locust concurrency (8,16,32)\\+ prompt traces (Alpaca/Long)};
+    \node[phys, right=of servers] (eval) {\textbf{4. Unified ML Predictors}\\Analytical H100 Rooflines\\Token count ablation study\\\textit{Linear \& Tree modeling}};
+
+    \draw[arrow] (env) -- (models);
+    \draw[arrow] (models) -- (servers);
+    \draw[arrow] (servers) -- (eval);
+\end{tikzpicture}
+\end{center}
+
+\vspace{-0.7em}
+\subsection*{2. Harmonized Dataset Schema: Integrating Imai et al. with Existing Benchmarks}
+\vspace{-0.3em}
+To enable unified cross-model and cross-engine modeling, we merge Imai et al.'s load-testing parameters with our cluster parallelism features. Columns newly introduced for the BSC HPC campaign are highlighted in color:
+
+\vspace{-0.3em}
+\begin{table}[htbp]
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{0.85}
+\setlength{\tabcolsep}{3.0pt}
+\begin{tabular}{p{2.3cm} p{3.7cm} p{3.6cm} p{8.0cm}}
+\toprule
+\textbf{Feature Group} & \textbf{Column Name} & \textbf{Data Type / Domain} & \textbf{Methodological Purpose \& Description} \\
+\midrule
+\textbf{Model Topology} & \texttt{model\_name, num\_params} & Categorical / Integer & Architecture identification across scales (1.3B to 27B parameters). \\
+ & \texttt{tp\_degree, pp\_degree, dp\_degree} & Integer ($\{1, 2, 4\}$) & Parallelism tensor/pipeline/data degrees. \\
+ & \textcolor{colcluster}{\textbf{num\_nodes, num\_gpus}} & \textcolor{colcluster}{Integer ($1, 2 \text{ nodes; } 1\dots 8 \text{ GPUs}$)} & \textcolor{colcluster}{\textbf{NEW (HPC):}} Multi-node scaling over 800 Gb/s NDR200 InfiniBand fabric. \\
+\midrule
+\textbf{Serving Context} & \textcolor{colcluster}{\textbf{server\_engine}} & \textcolor{colcluster}{\texttt{vLLM} vs. \texttt{Triton-vLLM}} & \textcolor{colcluster}{\textbf{NEW (Engine):}} Tests runtime overhead gap identified by Imai et al. \\
+ & \textcolor{colimai}{\textbf{load\_regime}} & \textcolor{colimai}{\texttt{locust} vs. \texttt{trace\_batch}} & \textcolor{colimai}{\textbf{NEW (Load):}} Disentangles concurrent client requests from static batch sizes. \\
+ & \textcolor{colimai}{\textbf{concurrent\_users}} & \textcolor{colimai}{Integer ($8, 16, 32$) / N/A} & \textcolor{colimai}{\textbf{NEW (Imai):}} Locust concurrency parameter used in Imai et al. Table 1. \\
+ & \texttt{input\_tokens, output\_tokens} & Integer ($32\dots 2048$) & Prompt token count and max generation budget (pre-execution features). \\
+\midrule
+\textbf{Physical Ceilings} & \texttt{roofline\_analytical\_latency} & Float (Seconds) & Unscaled theoretical single-GPU execution ceiling via LLM-Viewer. \\
+% & \textcolor{colphys}{\textbf{roofline\_parallel\_aware}} & \textcolor{colphys}{Float (Seconds)} & \textcolor{colphys}{\textbf{NEW (Physics):}} Ceiling scaled by TP, PP bubbles, and partitioned batch ($B/\text{DP}$). \\
+\midrule
+\textbf{Ground Truth} & \texttt{duration, throughput, power} & Float (ms, tok/s, W) & Measured end-to-end latency (regression target), throughput, and energy. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{-0.7em}
+\subsection*{3. HPC Compute Allocation Budget (BSC MareNostrum 5 Accelerated Partition)}
+\vspace{-0.3em}
+MareNostrum 5 provides 4x NVIDIA H100 SXM (64GB) per node. Testing 8 GPUs utilizes 2 nodes over NDR200 InfiniBand. Below is the compute budget breakdown to collect all required benchmark data:
+
+\vspace{-0.3em}
+\begin{table}[htbp]
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{0.85}
+\setlength{\tabcolsep}{3.0pt}
+\begin{tabular}{p{4.1cm} p{2.5cm} p{3.2cm} p{4.0cm} c r}
+\toprule
+\textbf{Experimental Campaign} & \textbf{Evaluated Models} & \textbf{Hardware Setup} & \textbf{Total Configurations} & \textbf{Wall Time} & \textbf{Compute Budget} \\
+\midrule
+\textbf{Phase 1A: Imai Replication} & 4 models (1.3B--2.7B) & 1 GPU (SXM), vLLM + Triton & 9 configs $\times$ 3 reps $\times$ 2 servers & $\approx 18$ hours & \textbf{18 GPU-h} \\
+\textbf{Phase 1B: Multi-GPU Scaling} & 4 models (1.3B--2.7B) & TP$\{2,4\}$, DP$\{2,4\}$ (1 node) & 4 configs $\times$ 6 workloads $\times$ 3 reps & $\approx 8$ hours & \textbf{28 GPU-h} \\
+\textbf{Phase 2: Triton Qwen Runs} & Qwen3-14B / 27B & 1, 2, 4, 8 GPUs (1--2 nodes) & Matches existing 450 vLLM runs & $\approx 15$ hours & \textbf{60 GPU-h} \\
+\textbf{Phase 3: Roofline Ceilings} & All 6 target models & Offline CPU analytical model & 54 discrete hardware ceilings & $< 1$ hour & \textbf{0 GPU-h (CPU)} \\
+\midrule
+\textbf{Total HPC Allocation} & \textbf{6 Architectures} & \textbf{1 to 8 H100 GPUs} & \textbf{$\sim 1,180$ executed trials} & \textbf{$\approx 41$ hours} & \textbf{$\approx 106$ GPU-h} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \end{document}
+
