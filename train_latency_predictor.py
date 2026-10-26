@@ -19,9 +19,10 @@ Note on Data Aggregation:
 """
 
 import os
+import tempfile
 
 # Prevent matplotlib directory permission warning
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib_cache")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib_cache"))
 
 import numpy as np
 import pandas as pd
@@ -136,7 +137,7 @@ def plot_takeaway(r2_ablation, r2_generalization, output_path=None):
 
     ax1.bar(x - width, r2_base, width, label="Parallelism Only (Feature Collision)", color="#d9534f", edgecolor="black")
     ax1.bar(x,         r2_task, width, label="+ Categorical Task (Alpaca/Longbench)", color="#337ab7", edgecolor="black", hatch="//")
-    ax1.bar(x + width, r2_rlm,  width, label="+ Analytical Roofline (RLM)", color="#5cb85c", edgecolor="black", hatch="\\\\")
+    ax1.bar(x + width, r2_rlm,  width, label="+ Task + Analytical Roofline (RLM)", color="#5cb85c", edgecolor="black", hatch="\\\\")
 
     ax1.set_ylabel("Cross-Validated R² Score", fontsize=11, fontweight="bold")
     ax1.set_title("A. In-Distribution Feature Ablation (3-Fold CV)", fontsize=11, fontweight="bold")
@@ -144,7 +145,7 @@ def plot_takeaway(r2_ablation, r2_generalization, output_path=None):
     ax1.set_xticklabels(labels, fontsize=10)
     ax1.set_ylim(0, 1.05)
     ax1.grid(axis="y", linestyle="--", alpha=0.3)
-    ax1.legend(fontsize=8.5, loc="upper left")
+    ax1.legend(fontsize=8.0, loc="upper left")
 
     for i in range(len(labels)):
         ax1.annotate(f"{r2_task[i]:.2f}", xy=(x[i], r2_task[i] + 0.02), ha="center", fontsize=8.5, fontweight="bold", color="#1d4b75")
@@ -191,7 +192,7 @@ def main():
 
     cols_base = ["batch_size", "output_tokens", "tp_degree", "pp_degree", "dp_degree", "num_gpus"]
     cols_task = cols_base + ["task"]
-    cols_rlm = cols_base + ["roofline_analytical_latency"]
+    cols_rlm = cols_base + ["task", "roofline_analytical_latency"]
 
     # 1. Feature Ablation (3-Fold CV on clean configuration dataset)
     cv_kfold = KFold(n_splits=3, shuffle=True, random_state=42)
@@ -208,7 +209,7 @@ def main():
     print("\n" + "─" * 88)
     print("1. FEATURE ABLATION (RANDOM 3-FOLD CV)")
     print("─" * 88)
-    print(f"{'Method':<20} │ {'Base (Collision)':^19} │ {'+ Categorical Task':^21} │ {'+ Roofline (RLM)':^20}")
+    print(f"{'Method':<20} │ {'Base (Collision)':^19} │ {'+ Categorical Task':^21} │ {'+ Task + Roofline (RLM)':^25}")
     print(f"{'':<20} │ {'R²':>7}   {'MSE':>8} │ {'R²':>7}    {'MSE':>8} │ {'R²':>7}   {'MSE':>8}")
     print("─" * 88)
     for m in res_base:

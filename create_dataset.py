@@ -6,12 +6,12 @@ Generates the reproduction dataset from raw_results_no_eager_v1.ods based on:
 - Hardware: Single node with 8x NVIDIA H100 GPUs
 - Engine: vLLM 0.19.2 with CUDA graphs (enforce_eager=False)
 - Datasets (Sheets):
-    1. Alpaca (short prompt, ~512 input tokens) - 330 runs
-    2. Longbench (long-context prompt, ~2048 input tokens) - 120 runs
+    1. Alpaca - 330 runs
+    2. Longbench - 120 runs
     Total: 450 runs
 - Models: Qwen3-14B and Qwen3.5-27B
 - Parallelization: Single GPU, TP, PP, DP combinations
-- Roofline analytical latency: Computed via LLM-Viewer on NVIDIA H100
+- Roofline analytical latency: Computed via LLM-Viewer on NVIDIA H100 (following Imai et al.)
 """
 
 import os
@@ -85,19 +85,15 @@ def compute_all_roofline_latencies():
         parallel_roofline_cache: parallelism-aware (accounting for tp, pp, dp)
     """
     # Pre-calculated benchmark dictionary via LLM-Viewer on NVIDIA H100 (SXM, 3.07 TB/s, 989.5 TFLOPS)
+    # Following Imai et al. (NeurIPS 2024 ML for Systems):
+    # Latency ceiling is modeled based on hardware, model architecture, batch size, and generation length (seqlen=1).
     roofline_cache = {
-        ("Alpaca", "Qwen3-14B", 128, 500): 8.717,
-        ("Alpaca", "Qwen3-14B", 256, 500): 12.879,
-        ("Alpaca", "Qwen3-14B", 256, 2000): 39.516,
-        ("Longbench", "Qwen3-14B", 128, 500): 22.047,
-        ("Longbench", "Qwen3-14B", 256, 500): 39.540,
-        ("Longbench", "Qwen3-14B", 256, 2000): 100.091,
-        ("Alpaca", "Qwen3.5-27B", 128, 500): 13.256,
-        ("Alpaca", "Qwen3.5-27B", 256, 500): 19.252,
-        ("Alpaca", "Qwen3.5-27B", 256, 2000): 58.438,
-        ("Longbench", "Qwen3.5-27B", 128, 500): 34.120,
-        ("Longbench", "Qwen3.5-27B", 256, 500): 58.640,
-        ("Longbench", "Qwen3.5-27B", 256, 2000): 152.880,
+        ("Qwen3-14B", 128, 500): 4.846,
+        ("Qwen3-14B", 256, 500): 5.128,
+        ("Qwen3-14B", 256, 2000): 20.481,
+        ("Qwen3.5-27B", 128, 500): 7.723,
+        ("Qwen3.5-27B", 256, 500): 8.173,
+        ("Qwen3.5-27B", 256, 2000): 32.643,
     }
     parallel_roofline_cache = {}
 
@@ -110,7 +106,6 @@ def compute_all_roofline_latencies():
             from model_analyzer import ModelAnalyzer
             import importlib
 
-            task_in = {"Alpaca": 512, "Longbench": 2048}
             for m_name, specs in MODEL_SPECS.items():
                 analyzer = ModelAnalyzer.__new__(ModelAnalyzer)
                 analyzer.model_id = m_name
@@ -125,39 +120,36 @@ def compute_all_roofline_latencies():
                 )
                 analyzer.config = importlib.import_module("configs.Qwen")
 
-                for task, in_t in task_in.items():
-                    for bs, out_t in [(128, 500), (256, 500), (256, 2000)]:
-                        # 1. Unscaled baseline
-                        res = analyzer.analyze(
-                            batchsize=bs, seqlen=in_t, w_bit=16, a_bit=16, kv_bit=16,
-                            use_flashattention=False, tp_size=1
-                        )
-                        t_prefill = res["total_results"]["prefill"]["inference_time"]
-                        t_decode = res["total_results"]["decode"]["inference_time"]
-                        roofline_cache[(task, m_name, bs, out_t)] = round(t_prefill + (out_t * t_decode), 3)
+                for bs, out_t in [(128, 500), (256, 500), (256, 2000)]:
+                    # 1. Unscaled baseline (uniform seqlen=1 following Imai et al.)
+                    res = analyzer.analyze(
+                        batchsize=bs, seqlen=1, w_bit=16, a_bit=16, kv_bit=16,
+                        use_flashattention=False, tp_size=1
+                    )
+                    t_prefill = res["total_results"]["prefill"]["inference_time"]
+                    t_decode = res["total_results"]["decode"]["inference_time"]
+                    roofline_cache[(m_name, bs, out_t)] = round(t_prefill + (out_t * t_decode), 3)
 
-                        # 2. Parallelism-aware combinations
-                        for tp in [1, 2, 4]:
-                            for pp in [1, 2, 4]:
-                                for dp in [1, 2, 4]:
-                                    eff_bs = max(1, bs // dp)
-                                    res_p = analyzer.analyze(
-                                        batchsize=eff_bs, seqlen=in_t, w_bit=16, a_bit=16, kv_bit=16,
-                                        use_flashattention=False, tp_size=tp
-                                    )
-                                    tp_pref = res_p["total_results"]["prefill"]["inference_time"]
-                                    tp_dec = res_p["total_results"]["decode"]["inference_time"]
+                    # 2. Parallelism-aware combinations
+                    for tp in [1, 2, 4]:
+                        for pp in [1, 2, 4]:
+                            for dp in [1, 2, 4]:
+                                eff_bs = max(1, bs // dp)
+                                res_p = analyzer.analyze(
+                                    batchsize=eff_bs, seqlen=1, w_bit=16, a_bit=16, kv_bit=16,
+                                    use_flashattention=False, tp_size=tp
+                                )
+                                tp_pref = res_p["total_results"]["prefill"]["inference_time"]
+                                tp_dec = res_p["total_results"]["decode"]["inference_time"]
 
-                                    # PP scaling with bubble overhead
-                                    if pp == 1:
-                                        pp_factor = 1.0
-                                    else:
-                                        bubble = (pp - 1) * 0.25
-                                        pp_factor = pp / (1.0 + bubble)
-                                        if in_t <= 512 and pp == 2:
-                                            pp_factor = 1.0  # short prompt serial execution
-                                    lat_par = round((tp_pref + out_t * tp_dec) / pp_factor, 3)
-                                    parallel_roofline_cache[(task, m_name, bs, out_t, tp, pp, dp)] = lat_par
+                                # PP scaling with bubble overhead
+                                if pp == 1:
+                                    pp_factor = 1.0
+                                else:
+                                    bubble = (pp - 1) * 0.25
+                                    pp_factor = pp / (1.0 + bubble)
+                                lat_par = round((tp_pref + out_t * tp_dec) / pp_factor, 3)
+                                parallel_roofline_cache[(m_name, bs, out_t, tp, pp, dp)] = lat_par
         except Exception:
             pass
 
@@ -227,7 +219,6 @@ def main():
         "dp_degree",
         "num_gpus",
         "workload",
-        "input_tokens",
         "batch_size",
         "output_tokens",
         "duration",
@@ -255,7 +246,6 @@ def main():
         
         # Standardize task name
         task = "Longbench" if "longbench" in sheet_name.lower() else "Alpaca"
-        in_tokens = 2048 if task == "Longbench" else 512
 
         count_sheet = 0
         for r in rows[1:]:
@@ -295,11 +285,11 @@ def main():
             # LLM architectural specs
             arch_specs = MODEL_SPECS[m_name]
 
-            # LLM-Viewer Roofline latency
-            roofline_key = (task, m_name, bs, out_tokens)
+            # LLM-Viewer Roofline latency (following Imai et al. model + batch + output_tokens)
+            roofline_key = (m_name, bs, out_tokens)
             roofline_lat = roofline_map.get(roofline_key, 20.0)
 
-            roofline_par_key = (task, m_name, bs, out_tokens, tp, pp, dp)
+            roofline_par_key = (m_name, bs, out_tokens, tp, pp, dp)
             roofline_par_lat = roofline_par_map.get(roofline_par_key, roofline_lat)
 
             record = {
@@ -312,7 +302,6 @@ def main():
                 "dp_degree": dp,
                 "num_gpus": num_gpus,
                 "workload": workload,
-                "input_tokens": in_tokens,
                 "batch_size": bs,
                 "output_tokens": out_tokens,
                 "duration": duration,

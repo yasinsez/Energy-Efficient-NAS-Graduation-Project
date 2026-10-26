@@ -51,7 +51,7 @@ While prompt length is known pre-execution, output length is dynamic. As acknowl
     \item \textbf{Data Aggregation}: To prevent duplicate data leakage across repeated benchmark trials, the 10 replicate runs per setting are aggregated into unique configuration means ($N=24$ unique configurations for Qwen3-14B) prior to modeling.
     \item \textbf{Feature Collision (Why Base Fails)}: Without a workload indicator, identical launch configurations (\texttt{batch\_size=128, out=500, DP2}) predict both Alpaca ($\approx 54\text{ ms}$) and Longbench ($\approx 452\text{ ms}$). This severe collision causes baseline $R^2$ to collapse ($R^2 < 0$).
     \item \textbf{Resolving Workloads via Categorical Task}: Providing a categorical task indicator (\texttt{task: Alpaca vs. Longbench}) resolves the collision, allowing tree models to achieve $R^2 \approx 0.63$.
-    \item \textbf{Value of Analytical Roofline}: The analytical Roofline Model provides a physical inductive bias that significantly benefits linear estimators ($R^2 = 0.2791 \to 0.5024$, 42\% MSE reduction), while providing robust out-of-distribution generalization across unseen parallelism configurations (GroupKFold $R^2 = 0.44 - 0.51$).
+    \item \textbf{Value of Analytical Roofline}: Following Imai et al., analytical Roofline latency is modeled strictly from hardware ceilings, batch size, and generation length without artificial prompt token assumptions. When combined with workload classification, it provides physical inductive bias that reduces mean squared error on tree ensembles by up to 18.2\% (GB MSE drops from $109313 \to 89363$, RF MSE to $92138$), while maintaining robust out-of-distribution generalization across unseen parallelism configurations (GroupKFold $R^2 \approx 0.51$).
 \end{itemize}
 
 \vspace{-0.8em}
@@ -65,33 +65,25 @@ While prompt length is known pre-execution, output length is dynamic. As acknowl
 \label{tab:takeaway}
 \begin{tabular}{l ccc c}
 \toprule
-\textbf{Model / Estimator} & \textbf{Base (Collision)} & \textbf{Base + Categorical Task} & \textbf{Base + Analytical RLM} & \textbf{Key Takeaway} \\
+\textbf{Model / Estimator} & \textbf{Base (Collision)} & \textbf{Base + Categorical Task} & \textbf{Task + Analytical RLM} & \textbf{Key Takeaway} \\
 \midrule
-Linear Regression (LR)          & -0.9465 / 373347 & 0.2791 / 140298 & \textbf{0.5024 / 80841} & RLM provides linear prior \\
-Random Forest (RF)              & -0.7947 / 397206 & \textbf{0.6265 / 100881} & 0.5779 / 82980  & Resolves workload collision \\
-Gradient Boosting (GB)          & -1.5466 / 522026 & 0.5644 / 109313 & \textbf{0.6451 / 107853} & Strong tree performance \\
+Linear Regression (LR)          & -0.9465 / 373347 & \textbf{0.2791 / 140298} & \textbf{0.2791 / 140298} & Task resolves collision \\
+Random Forest (RF)              & -0.7947 / 397206 & 0.6265 / 100881          & \textbf{0.6413 / 92138}  & RLM cuts MSE by 8.7\% \\
+Gradient Boosting (GB)          & -1.5466 / 522026 & 0.5644 / 109313          & \textbf{0.6100 / 89363}  & RLM cuts MSE by 18.2\% \\
 \midrule
 \multicolumn{5}{l}{\textit{\textbf{Out-of-Distribution Generalization (+Roofline, GroupKFold across Unseen Parallelism)}}} \\
-\multicolumn{5}{l}{Linear Regression: $R^2 = 0.4370$ (MSE $109206$); Random Forest: $R^2 = 0.5136$ (MSE $109608$); Gradient Boosting: $R^2 = 0.4812$ (MSE $139475$)} \\
+\multicolumn{5}{l}{Linear Regression: $R^2 = 0.3708$ (MSE $135333$); Random Forest: $R^2 = 0.5148$ (MSE $108194$); Gradient Boosting: $R^2 = 0.4768$ (MSE $113426$)} \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-% \begin{figure}[htbp]
-% \centering
-% \includegraphics[width=0.66\textwidth]{figures/roofline_task_omission_impact.png}
-% \vspace{-0.7em}
-% \caption{\textbf{(A)} Ablation: A simple token count matches Roofline accuracy on tree ensembles ($R^2=0.9997$). \textbf{(B)} Generalization collapse: In-distribution accuracy reflects discrete cell memorization; GroupKFold exposes realistic out-of-distribution performance.}
-% \label{fig:takeaway}
-% \end{figure}
 
 \vspace{-0.5em}
 \section*{Key Conclusions for Deployment \& Next Steps}
 \begin{itemize}
     \setlength\itemsep{0.02em}
     \item \textbf{Unique Configuration Modeling}: Aggregating repeated physical trials ensures clean, leakage-free evaluation without artificial lookup-table memorization.
-    \item \textbf{Workload Characterization}: Static token assignments are replaced with explicit workload identifiers. Production deployments should capture continuous prompt length distributions from client traffic traces.
-    \item \textbf{Physics as an Inductive Prior}: Analytical Roofline latency serves as a vital physical anchor for linear estimators ($R^2 = 0.2791 \to 0.5024$) and cross-architecture hardware scaling.
+    \item \textbf{Workload Characterization}: In alignment with Imai et al., static token count assignments are removed. Explicit workload identifiers resolve feature collisions, and production deployments should capture continuous prompt distributions from telemetry.
+    \item \textbf{Physics as an Inductive Prior}: Analytical Roofline latencies provide physical hardware scaling bounds that lower prediction variance and improve generalization across unseen cluster parallelisms ($R^2 \approx 0.51$).
     \item \textbf{Experimental Next Steps}: Scale evaluation across heterogeneous architectures (14B to 27B) on BSC MareNostrum 5 under continuous load distributions.
 \end{itemize}
 
