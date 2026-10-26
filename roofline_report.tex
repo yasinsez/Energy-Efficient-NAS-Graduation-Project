@@ -14,6 +14,9 @@
 \definecolor{colcluster}{RGB}{0, 115, 120}
 \definecolor{colimai}{RGB}{20, 85, 170}
 \definecolor{colphys}{RGB}{125, 30, 140}
+\definecolor{colhf}{RGB}{210, 85, 20}
+\definecolor{colmerge}{RGB}{30, 125, 60}
+\definecolor{colmodel}{RGB}{175, 45, 45}
 \definecolor{boxbg}{RGB}{246, 248, 251}
 \definecolor{boxborder}{RGB}{185, 198, 212}
 
@@ -88,6 +91,176 @@ Gradient Boosting (GB)          & -1.5466 / 522026 & -1.5455 / 521479 & 0.5644 /
     \item \textbf{Experimental Next Steps}: Scale evaluation across heterogeneous architectures (14B to 27B) on BSC MareNostrum 5 under continuous load distributions.
 \end{itemize}
 
+
+\clearpage
+
+\section*{End-to-End Operational Pipeline \& Data Lineage Architecture}
+\vspace{-0.3em}
+To guarantee rigorous, leakage-free modeling of LLM serving latency, our workflow orchestrates public model metadata, analytical hardware modeling, and empirical multi-GPU cluster measurements through a synchronized data pipeline.
+
+\vspace{-0.4em}
+\subsection*{1. Architectural Pipeline \& Operational Workflow}
+\vspace{-0.3em}
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.22cm,
+    font=\scriptsize,
+    every node/.style={align=center},
+    card/.style={rectangle, rounded corners=3pt, inner sep=3.0pt, line width=0.65pt, text width=3.30cm, minimum height=3.05cm},
+    srcbox/.style={card, draw=colhf!85, fill=colhf!7},
+    physbox/.style={card, draw=colphys!85, fill=colphys!7},
+    clustbox/.style={card, draw=colcluster!85, fill=colcluster!7},
+    mergebox/.style={card, draw=colmerge!85, fill=colmerge!7, text width=3.38cm},
+    aggbox/.style={card, draw=colimai!85, fill=colimai!7, text width=3.38cm},
+    modelbox/.style={rectangle, rounded corners=3pt, draw=colmodel!85, fill=colmodel!7, inner sep=3.5pt, line width=0.7pt, text width=18.4cm},
+    arrow/.style={-{Stealth[scale=0.8]}, line width=0.7pt, color=black!75}
+]
+
+    % Row 1: 5 Horizontal Cards
+    \node[srcbox] (hf) at (0,0) {
+        \textbf{1. Hugging Face Hub}\\
+        \href{https://huggingface.co/Qwen}{\texttt{\tiny hf.co/Qwen/*}}\\
+        \href{https://huggingface.co/datasets}{\texttt{\tiny hf.co/datasets/*}}\\
+        \vspace{0.1em}\hrule\vspace{0.2em}
+        \tiny \textbf{Arch Parameters:}\\
+        \texttt{num\_params, hidden\_size, heads, kv\_heads, layers, vocab, intermediate, arch, act}\\
+        \vspace{0.1em}
+        \textbf{Workload Tasks:}\\
+        \texttt{Alpaca}, \texttt{LongBench}
+    };
+
+    \node[physbox, right=0.22cm of hf] (phys) {
+        \textbf{2. Analytical Physics}\\
+        \texttt{\tiny LLM-Viewer (Imai et al.)}\\
+        \vspace{0.1em}\hrule\vspace{0.2em}
+        \tiny Hardware: NVIDIA H100 SXM\\
+        (3.07 TB/s, 989.5 TFLOPS)\\
+        Input: Arch Specs + BS + Out\\
+        \vspace{0.1em}
+        \textbf{Outputs (Hardware Ceilings):}\\
+        \texttt{roofline\_analytical\_latency}\\
+        \texttt{roofline\_parallel\_aware}
+    };
+
+    \node[clustbox, right=0.22cm of phys] (bench) {
+        \textbf{3. Empirical Benchmarks}\\
+        \texttt{\tiny raw\_results\_no\_eager\_v1.ods}\\
+        \vspace{0.1em}\hrule\vspace{0.2em}
+        \tiny 8$\times$ NVIDIA H100 (vLLM 0.19.2)\\
+        450 Replicate Benchmark Runs\\
+        \vspace{0.1em}
+        \textbf{Raw Logged Columns:}\\
+        \texttt{run\_id, model\_name, config,}\\
+        \texttt{workload, duration, throughput,}\\
+        \texttt{mj\_per\_token, gpu\_avg\_power}
+    };
+
+    \node[mergebox, right=0.22cm of bench] (merge) {
+        \textbf{4. Ingestion \& Merge}\\
+        \texttt{\tiny create\_dataset.py}\\
+        \vspace{0.1em}\hrule\vspace{0.2em}
+        \tiny Parse: \texttt{config} $\to$ \texttt{tp, pp, dp, gpus}\\
+        Parse: \texttt{workload} $\to$ \texttt{bs, out\_tokens}\\
+        Join HF Specs + Roofline + Runs\\
+        \vspace{0.1em}
+        \textbf{Consolidated Dataset:}\\
+        \texttt{reproduced\_dataset.csv}\\
+        \textit{450 runs $\times$ 26 schema columns}
+    };
+
+    \node[aggbox, right=0.22cm of merge] (agg) {
+        \textbf{5. Anti-Leakage Filter}\\
+        \texttt{\tiny train\_latency\_predictor.py}\\
+        \vspace{0.1em}\hrule\vspace{0.2em}
+        \tiny Groupby: (\texttt{task, config, workload})\\
+        Collapses 10$\times$ replicate trials $\to$ mean\\
+        Eliminates cross-fold leakage\\
+        \vspace{0.1em}
+        \textbf{Clean Modeling Matrix:}\\
+        $N=24$ unique cells (Qwen3-14B)
+    };
+
+    % Row 1 Connectors
+    \draw[arrow] (hf.east) -- (phys.west);
+    \draw[arrow] (hf.north) -- ++(0,0.20) -| ([xshift=-4mm]merge.north);
+    \draw[arrow] (phys.south) -- ++(0,-0.20) -| ([xshift=-4mm]merge.south);
+    \draw[arrow] (bench.east) -- (merge.west);
+    \draw[arrow] (merge.east) -- (agg.west);
+
+    % Row 2: Model Evaluation Box
+    \node[modelbox, below=0.46cm of bench] (models) {
+        \textbf{6. Downstream Predictive Latency Modeling \& Feature Set Evaluation} \quad (\textit{Target: } $y = \text{mean duration in ms}$)\\
+        \vspace{0.15em}
+        \setlength{\tabcolsep}{2.5pt}
+        \begin{tabular}{p{3.2cm} p{5.0cm} p{3.8cm} p{5.6cm}}
+            \tiny \textbf{Feature Configuration} & \tiny \textbf{Input Feature Vector ($X$)} & \tiny \textbf{Evaluated Estimators} & \tiny \textbf{Empirical Observation} \\
+            \tiny \textbf{1. Base (Collision)} & \tiny \texttt{[bs, out\_tokens, tp, pp, dp, gpus]} & \tiny Linear Reg, Random Forest, GradBoost & \tiny $R^2 < 0$; fails due to prompt length omission \\
+            \tiny \textbf{2. Base + Analytical RLM} & \tiny Base + \texttt{[roofline\_analytical\_latency]} & \tiny Linear Reg, Random Forest, GradBoost & \tiny $R^2 < 0$; identical ceilings for both tasks \\
+            \tiny \textbf{3. Base + Categorical Task} & \tiny Base + \texttt{[task: Alpaca vs. Longbench]} & \tiny Linear Reg, Random Forest, GradBoost & \tiny $R^2 \approx 0.63$; resolves feature collision \\
+            \tiny \textbf{4. Task + Analytical RLM} & \tiny Base + \texttt{[task, roofline\_analytical\_latency]} & \tiny Linear Reg, Random Forest, GradBoost & \tiny \textbf{$R^2 \approx 0.64$; cuts tree MSE by 18.2\% (Best)}
+        \end{tabular}
+    };
+
+    \draw[arrow] (agg.south) -- (agg.south |- models.north);
+
+\end{tikzpicture}
+\end{center}
+
+\vspace{-0.7em}
+\subsection*{2. Data Provenance \& Feature Lineage Specification}
+\vspace{-0.3em}
+\begin{table}[htbp]
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{0.82}
+\setlength{\tabcolsep}{2.5pt}
+\caption{Detailed Lineage of Origin Attributes, Processing Transformations, and Target Allocations.}
+\label{tab:pipeline_lineage}
+\begin{tabular}{p{2.3cm} p{2.8cm} p{5.1cm} p{1.4cm} p{6.2cm}}
+\toprule
+\textbf{Pipeline Source} & \textbf{Origin URL / File} & \textbf{Extracted Attributes / Columns} & \textbf{Data Type} & \textbf{Role in Downstream Pipeline} \\
+\midrule
+\textbf{Hugging Face Hub} & \href{https://huggingface.co/Qwen}{\texttt{hf.co/Qwen/*}} & \texttt{num\_parameters, hidden\_size, num\_attention\_heads, num\_key\_value\_heads, num\_hidden\_layers, vocab\_size, intermediate\_size, architecture, hidden\_act} & Int, Float, Categorical & Model architecture topology specs; parameterizes analytical Roofline execution ceilings and cross-model capacity. \\
+\addlinespace[0.15em]
+\textbf{Hugging Face Datasets} & \href{https://huggingface.co/datasets/tatsu-lab/alpaca}{\texttt{tatsu-lab/alpaca}} \newline \href{https://huggingface.co/datasets/THUDM/LongBench}{\texttt{THUDM/LongBench}} & \texttt{task} (\texttt{Alpaca} vs. \texttt{Longbench}) & Categorical & Disambiguates prompt context regimes (short-context instruction $\approx 512$ tok vs. long-context $\approx 2048$ tok). \\
+\addlinespace[0.15em]
+\textbf{Analytical Physics (LLM-Viewer)} & Hardware Model \newline (NVIDIA H100 SXM) & \texttt{roofline\_analytical\_latency}, \newline \texttt{roofline\_parallel\_aware} & Float (Seconds) & Hardware execution bounds computed via Roofline arithmetic intensity; serves as physical inductive prior for ML regressors. \\
+\addlinespace[0.15em]
+\textbf{Empirical Cluster Benchmarks} & Multi-GPU H100 Cluster \newline (\texttt{raw\_results\_v1.ods}) & \texttt{run\_id, model\_name, config, workload, duration, throughput, mj\_per\_token, gpu\_avg\_power} & Mixed & Empirical ground-truth telemetry from 450 vLLM serving runs across TP/PP/DP parallelisms and batch configurations. \\
+\addlinespace[0.15em]
+\textbf{Merge Pipeline} \newline \tiny (\texttt{create\_dataset.py}) & Synthesized Dataset \newline \tiny (\texttt{reproduced\_dataset.csv}) & \texttt{tp\_degree, pp\_degree, dp\_degree, num\_gpus, batch\_size, output\_tokens} & Integer & Decomposes raw configuration/workload strings into explicit numerical launch parameters; unifies all sources into 26 columns. \\
+\addlinespace[0.15em]
+\textbf{Anti-Leakage Filter} \newline \tiny (\texttt{load\_dataset}) & Cross-Validation Matrix \newline \tiny (\texttt{train\_latency\_predictor}) & Mean \texttt{duration} (Target $y$), Mean \texttt{throughput}, Mean \texttt{gpu\_avg\_power} & Float & Aggregates 10 replicate physical trials into unique configuration means ($N=24$), eliminating cross-fold memorization leakage. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{-0.7em}
+\subsection*{3. Feature Utilization Matrix Across Downstream Estimators}
+\vspace{-0.3em}
+\begin{table}[htbp]
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{0.82}
+\setlength{\tabcolsep}{2.5pt}
+\caption{Feature Set Composition and Downstream Predictive Modeling Outcomes.}
+\label{tab:model_features}
+\begin{tabular}{p{2.6cm} p{4.9cm} p{1.6cm} p{3.1cm} p{5.6cm}}
+\toprule
+\textbf{Model Feature Set} & \textbf{Included Features ($X$)} & \textbf{Target ($y$)} & \textbf{Evaluated Estimators} & \textbf{Methodological Rationale \& Impact} \\
+\midrule
+\textbf{Base Features} & \texttt{batch\_size, output\_tokens, tp\_degree, pp\_degree, dp\_degree, num\_gpus} & Mean \newline \texttt{duration} & LR, RF, GB & Pre-execution launch settings only. Fails ($R^2 < 0$) due to collision between Alpaca and Longbench. \\
+\addlinespace[0.12em]
+\textbf{+ Analytical RLM} & Base + \texttt{roofline\_analytical\_latency} & Mean \newline \texttt{duration} & LR, RF, GB & Tests whether physical ceiling alone resolves collision without prompt lengths. Fails ($R^2 < 0$). \\
+\addlinespace[0.12em]
+\textbf{+ Categorical Task} & Base + \texttt{task} (One-Hot Encoded) & Mean \newline \texttt{duration} & LR, RF, GB & Resolves collision by separating prompt regimes, unlocking tree model capacity ($R^2 = 0.63$ RF). \\
+\addlinespace[0.12em]
+\textbf{Task + Analytical RLM} & Base + \texttt{task} + \texttt{roofline\_analytical\_latency} & Mean \newline \texttt{duration} & LR, RF, GB & \textbf{Optimal configuration}: Reduces Gradient Boosting MSE by 18.2\%, generalizes across unseen parallelism ($R^2 \approx 0.51$). \\
+\addlinespace[0.12em]
+\textbf{Strictly Excluded} & \texttt{throughput, mj\_per\_token, gpu\_avg\_power} & N/A & Excluded & Post-execution telemetry; strictly prohibited to prevent target leakage in admission-time scheduling. \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \end{document}
 
