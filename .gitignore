@@ -5,3 +5,4 @@ __pycache__/
 *.tmp
 missfont.log
 raw_results_no_eager_v1.ods
+.venv/

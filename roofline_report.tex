@@ -45,14 +45,13 @@ In production LLM serving, latency predictors must operate \textbf{strictly pre-
 While prompt length is known pre-execution, output length is dynamic. As acknowledged by Imai et al. (Appendix A.4): \textit{``In practical application, the generation length is not predetermined... To accurately model inference latency in real world scenarios, we must consider predicting the generation length based on the input prompt.''}
 
 \vspace{0.1em}
-\noindent \textbf{Methodological Analysis: Single-Model Benchmark Artifact vs. Cross-Model Reality}:
+\noindent \textbf{Methodological Analysis: Operational Modeling vs. Analytical Physics}:
 \begin{itemize}
     \setlength\itemsep{0.03em}
-    \item \textbf{The Single-Model Confound (Why Trees Treat RLM as Tokens)}: In a fixed-model benchmark (Qwen3-14B) evaluated over discrete prompt lengths (512 vs.~2048), model parameters ($N_{\text{params}}, d_{\text{model}}, L$) and hardware ceilings are constant. Consequently, the analytical roofline $T_{\text{roofline}}$ is a strictly monotonic mathematical transform of \texttt{input\_tokens}. Non-linear tree ensembles (RF/GB) split either feature identically, yielding an identical $R^2 = 0.9997$ (MSE $91.2$ vs.~$87.8$). Within this single-model grid, RLM adds no distinct predictive signal beyond a binary prompt indicator.
-    \item \textbf{Why the Roofline Model Is Essential Across Models}: In production serving across heterogeneous model families (e.g., 1.3B to 27B), a raw scalar \texttt{input\_tokens} carries \textbf{zero architectural context}---512 tokens induces orders-of-magnitude different compute/memory load on a 1.3B vs.~a 27B model. The analytical Roofline Model bridges this gap by grounding predictions in model FLOPs, tensor dimensions, and hardware bandwidth.
-    \item \textbf{Linear Inductive Prior}: For linear regressors that cannot learn non-linear decision boundaries, RLM provides a meaningful physical inductive bias, reducing MSE by 45\% ($69038 \to 37921$, $R^2 = 0.7879 \to 0.8844$) compared to raw token counts.
-    % \item \textbf{Parallelism Scaling}: Unscaled RLM assumes single-GPU SXM ceilings. Scaling analytical ceilings by TP, DP (partitioned batch $B/\text{DP}$), and PP degrees improves physical correlation ($r = 0.85 \to 0.94$) and lowers linear regression MSE from $37921$ to $32339$.
-    % \item \textbf{Generalization Collapse (GroupKFold)}: Near-perfect accuracy ($R^2 = 0.9997$) in standard CV is an artifact of discrete cell memorization (10 identical replicates per cell). Testing on unseen parallelism or conditions via \textbf{GroupKFold} drops accuracy to \textbf{$R^2 = 0.45 - 0.65$}. However, RLM provides a vital inductive bias when extrapolating to unseen sequence lengths where trees collapse ($R^2 = -0.26$).
+    \item \textbf{Data Aggregation}: To prevent duplicate data leakage across repeated benchmark trials, the 10 replicate runs per setting are aggregated into unique configuration means ($N=24$ unique configurations for Qwen3-14B) prior to modeling.
+    \item \textbf{Feature Collision (Why Base Fails)}: Without a workload indicator, identical launch configurations (\texttt{batch\_size=128, out=500, DP2}) predict both Alpaca ($\approx 54\text{ ms}$) and Longbench ($\approx 452\text{ ms}$). This severe collision causes baseline $R^2$ to collapse ($R^2 < 0$).
+    \item \textbf{Resolving Workloads via Categorical Task}: Providing a categorical task indicator (\texttt{task: Alpaca vs. Longbench}) resolves the collision, allowing tree models to achieve $R^2 \approx 0.63$.
+    \item \textbf{Value of Analytical Roofline}: The analytical Roofline Model provides a physical inductive bias that significantly benefits linear estimators ($R^2 = 0.2791 \to 0.5024$, 42\% MSE reduction), while providing robust out-of-distribution generalization across unseen parallelism configurations (GroupKFold $R^2 = 0.44 - 0.51$).
 \end{itemize}
 
 \vspace{-0.8em}
@@ -60,24 +59,20 @@ While prompt length is known pre-execution, output length is dynamic. As acknowl
 \centering
 \scriptsize
 \renewcommand{\arraystretch}{0.85}
-\setlength{\tabcolsep}{3.5pt}
-\caption{Qwen3-14B: Independent Feature Set Ablation on Standard 3-Fold Cross-Validation ($R^2$ / MSE). \\
-\textit{Base features: \texttt{[tp, pp, dp, num\_gpus, batch\_size, output\_tokens]}. Columns 3 and 4 add either \texttt{input\_tokens} OR \texttt{Unscaled RLM} independently to the Base set to evaluate their standalone predictive impact.}}
+\setlength{\tabcolsep}{4.0pt}
+\caption{Qwen3-14B: Feature Set Ablation on Unique Configuration Means ($R^2$ / MSE). \\
+\textit{Evaluated on 24 aggregated configuration cells via 3-Fold Cross-Validation. Base features: \texttt{[tp, pp, dp, num\_gpus, batch\_size, output\_tokens]}.}}
 \label{tab:takeaway}
 \begin{tabular}{l ccc c}
 \toprule
-\textbf{Model / Estimator} & \textbf{Base (No Prompt Tok)} & \textbf{Base + input\_tokens} & \textbf{Base + Unscaled RLM} & \textbf{Key Takeaway} \\
+\textbf{Model / Estimator} & \textbf{Base (Collision)} & \textbf{Base + Categorical Task} & \textbf{Base + Analytical RLM} & \textbf{Key Takeaway} \\
 \midrule
-Linear Regression (LR)          & 0.3005 / 224574 & 0.7879 / 69038 & \textbf{0.8844 / 37921} & RLM aids linear fit \\
-Random Forest (RF)              & 0.2553 / 236926 & \textbf{0.9997 / 91.2}  & \textbf{0.9997 / 87.8}  & \textbf{Identical tree splits} \\
-Gradient Boosting (GB)          & 0.2494 / 238559 & \textbf{0.9997 / 113.8} & 0.9995 / 163.7 & \textbf{Identical tree splits} \\
-% \midrule
-% \multicolumn{5}{l}{\textit{\textbf{Part B: Generalization Degradation across GroupKFold Regimes (Random Forest $R^2$ / MSE)}}} \\
-% Standard 3-Fold (In-Distribution) & 0.2553 / 236926 & 0.9997 / 91.2  & 0.9997 / 87.8  & Discrete cell memorization \\
-% GroupKFold: (Config, Workload)    & 0.0797 / 264435 & 0.6481 / 106061 & 0.6354 / 110522 & Generalizes to new condition \\
-% GroupKFold: Parallelism Config   & -0.031 / 281116 & 0.4561 / 137257 & 0.4436 / 142060 & Generalizes to unseen degree \\
-% GroupKFold: Workload (LR Extrap.) & -0.658 / 391581 & -0.274 / 284794 & \textbf{+0.367 / 122258} & RLM enables extrapolation \\
-% Parallel-Aware RLM for LR: 0.8998 / 32339; RF: 0.9997 / 88.6; GB: 0.9997 / 96.7
+Linear Regression (LR)          & -0.9465 / 373347 & 0.2791 / 140298 & \textbf{0.5024 / 80841} & RLM provides linear prior \\
+Random Forest (RF)              & -0.7947 / 397206 & \textbf{0.6265 / 100881} & 0.5779 / 82980  & Resolves workload collision \\
+Gradient Boosting (GB)          & -1.5466 / 522026 & 0.5644 / 109313 & \textbf{0.6451 / 107853} & Strong tree performance \\
+\midrule
+\multicolumn{5}{l}{\textit{\textbf{Out-of-Distribution Generalization (+Roofline, GroupKFold across Unseen Parallelism)}}} \\
+\multicolumn{5}{l}{Linear Regression: $R^2 = 0.4370$ (MSE $109206$); Random Forest: $R^2 = 0.5136$ (MSE $109608$); Gradient Boosting: $R^2 = 0.4812$ (MSE $139475$)} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -94,11 +89,10 @@ Gradient Boosting (GB)          & 0.2494 / 238559 & \textbf{0.9997 / 113.8} & 0.
 \section*{Key Conclusions for Deployment \& Next Steps}
 \begin{itemize}
     \setlength\itemsep{0.02em}
-    \item \textbf{Single-Model Scope}: For isolated single-model deployments where prompt length is known pre-launch, empirical tree models achieve maximum accuracy using raw prompt tokens without analytical profiling.
-    \item \textbf{Cross-Model Serving}: The Roofline Model's primary value lies in cross-model and cross-hardware serving matrices, where physical parameter scaling ($O(\text{FLOPs})$, tensor sizes) is mandatory.
-    \item \textbf{Value for Linear Estimators}: RLM provides an effective inductive physics prior for linear estimators ($R^2 = 0.7879 \to 0.8844$, reducing MSE by 45\%).
-    % \item \textbf{Out-of-Distribution Generalization}: RLM provides inductive bias when extrapolating to unseen sequence lengths where purely empirical tree models collapse ($R^2 = -0.26 \to +0.37$).
-    \item \textbf{Experimental Next Steps}: Validate across continuous sequence lengths (dynamic RAG / chatbot traces) rather than fixed 2-point grids, and test multi-node scaling across 32B/70B architectures.
+    \item \textbf{Unique Configuration Modeling}: Aggregating repeated physical trials ensures clean, leakage-free evaluation without artificial lookup-table memorization.
+    \item \textbf{Workload Characterization}: Static token assignments are replaced with explicit workload identifiers. Production deployments should capture continuous prompt length distributions from client traffic traces.
+    \item \textbf{Physics as an Inductive Prior}: Analytical Roofline latency serves as a vital physical anchor for linear estimators ($R^2 = 0.2791 \to 0.5024$) and cross-architecture hardware scaling.
+    \item \textbf{Experimental Next Steps}: Scale evaluation across heterogeneous architectures (14B to 27B) on BSC MareNostrum 5 under continuous load distributions.
 \end{itemize}
 
 \clearpage
