@@ -129,15 +129,17 @@ def plot_takeaway(r2_ablation, r2_generalization, output_path=None):
     ax1 = axes[0]
     labels = ["Linear Regression", "Random Forest", "Gradient Boosting"]
     x = np.arange(len(labels))
-    width = 0.26
+    width = 0.19
 
     r2_base = [max(r2_ablation["Base"][m]["R2"], 0) for m in labels]
+    r2_rlm_alone = [max(r2_ablation["RLM_Alone"][m]["R2"], 0) for m in labels]
     r2_task = [max(r2_ablation["Task"][m]["R2"], 0) for m in labels]
-    r2_rlm  = [max(r2_ablation["Roofline"][m]["R2"], 0) for m in labels]
+    r2_task_rlm = [max(r2_ablation["Task_RLM"][m]["R2"], 0) for m in labels]
 
-    ax1.bar(x - width, r2_base, width, label="Parallelism Only (Feature Collision)", color="#d9534f", edgecolor="black")
-    ax1.bar(x,         r2_task, width, label="+ Categorical Task (Alpaca/Longbench)", color="#337ab7", edgecolor="black", hatch="//")
-    ax1.bar(x + width, r2_rlm,  width, label="+ Task + Analytical Roofline (RLM)", color="#5cb85c", edgecolor="black", hatch="\\\\")
+    ax1.bar(x - 1.5 * width, r2_base, width, label="Base (Parallelism Only)", color="#d9534f", edgecolor="black")
+    ax1.bar(x - 0.5 * width, r2_rlm_alone, width, label="+ Analytical RLM Alone", color="#f0ad4e", edgecolor="black", hatch="..")
+    ax1.bar(x + 0.5 * width, r2_task, width, label="+ Categorical Task", color="#337ab7", edgecolor="black", hatch="//")
+    ax1.bar(x + 1.5 * width, r2_task_rlm, width, label="+ Task + Analytical RLM", color="#5cb85c", edgecolor="black", hatch="\\\\")
 
     ax1.set_ylabel("Cross-Validated R² Score", fontsize=11, fontweight="bold")
     ax1.set_title("A. In-Distribution Feature Ablation (3-Fold CV)", fontsize=11, fontweight="bold")
@@ -145,11 +147,11 @@ def plot_takeaway(r2_ablation, r2_generalization, output_path=None):
     ax1.set_xticklabels(labels, fontsize=10)
     ax1.set_ylim(0, 1.05)
     ax1.grid(axis="y", linestyle="--", alpha=0.3)
-    ax1.legend(fontsize=8.0, loc="upper left")
+    ax1.legend(fontsize=7.5, loc="upper left")
 
     for i in range(len(labels)):
-        ax1.annotate(f"{r2_task[i]:.2f}", xy=(x[i], r2_task[i] + 0.02), ha="center", fontsize=8.5, fontweight="bold", color="#1d4b75")
-        ax1.annotate(f"{r2_rlm[i]:.2f}", xy=(x[i] + width, r2_rlm[i] + 0.02), ha="center", fontsize=8.5, fontweight="bold", color="#2e662e")
+        ax1.annotate(f"{r2_task[i]:.2f}", xy=(x[i] + 0.5 * width, r2_task[i] + 0.02), ha="center", fontsize=8.0, fontweight="bold", color="#1d4b75")
+        ax1.annotate(f"{r2_task_rlm[i]:.2f}", xy=(x[i] + 1.5 * width, r2_task_rlm[i] + 0.02), ha="center", fontsize=8.0, fontweight="bold", color="#2e662e")
 
     # ── Panel B: Out-of-Distribution Generalization (GroupKFold) ────────────
     ax2 = axes[1]
@@ -191,39 +193,43 @@ def main():
     print(f"Loaded {len(df)} unique experimental configurations for Qwen3-14B (replicate runs aggregated to mean).")
 
     cols_base = ["batch_size", "output_tokens", "tp_degree", "pp_degree", "dp_degree", "num_gpus"]
+    cols_rlm_alone = cols_base + ["roofline_analytical_latency"]
     cols_task = cols_base + ["task"]
-    cols_rlm = cols_base + ["task", "roofline_analytical_latency"]
+    cols_task_rlm = cols_base + ["task", "roofline_analytical_latency"]
 
     # 1. Feature Ablation (3-Fold CV on clean configuration dataset)
     cv_kfold = KFold(n_splits=3, shuffle=True, random_state=42)
     res_base, _ = evaluate_feature_set(df, cols_base, cv=cv_kfold)
+    res_rlm_alone, _ = evaluate_feature_set(df, cols_rlm_alone, cv=cv_kfold)
     res_task, _ = evaluate_feature_set(df, cols_task, cv=cv_kfold)
-    res_rlm, _ = evaluate_feature_set(df, cols_rlm, cv=cv_kfold)
+    res_task_rlm, _ = evaluate_feature_set(df, cols_task_rlm, cv=cv_kfold)
 
     r2_ablation = {
         "Base": res_base,
+        "RLM_Alone": res_rlm_alone,
         "Task": res_task,
-        "Roofline": res_rlm,
+        "Task_RLM": res_task_rlm,
     }
 
-    print("\n" + "─" * 88)
+    print("\n" + "─" * 102)
     print("1. FEATURE ABLATION (RANDOM 3-FOLD CV)")
-    print("─" * 88)
-    print(f"{'Method':<20} │ {'Base (Collision)':^19} │ {'+ Categorical Task':^21} │ {'+ Task + Roofline (RLM)':^25}")
-    print(f"{'':<20} │ {'R²':>7}   {'MSE':>8} │ {'R²':>7}    {'MSE':>8} │ {'R²':>7}   {'MSE':>8}")
-    print("─" * 88)
+    print("─" * 102)
+    print(f"{'Method':<18} │ {'Base (Collision)':^19} │ {'+ RLM Alone':^18} │ {'+ Categorical Task':^20} │ {'+ Task + RLM':^19}")
+    print(f"{'':<18} │ {'R²':>7}   {'MSE':>8} │ {'R²':>7}   {'MSE':>7} │ {'R²':>7}   {'MSE':>8} │ {'R²':>7}   {'MSE':>8}")
+    print("─" * 102)
     for m in res_base:
-        print(f"{m:<20} │ {res_base[m]['R2']:>7.4f}  {res_base[m]['MSE']:>8.0f} │ "
-              f"{res_task[m]['R2']:>7.4f}   {res_task[m]['MSE']:>8.0f} │ "
-              f"{res_rlm[m]['R2']:>7.4f}  {res_rlm[m]['MSE']:>8.0f}")
-    print("─" * 88)
+        print(f"{m:<18} │ {res_base[m]['R2']:>7.4f}  {res_base[m]['MSE']:>8.0f} │ "
+              f"{res_rlm_alone[m]['R2']:>7.4f}  {res_rlm_alone[m]['MSE']:>7.0f} │ "
+              f"{res_task[m]['R2']:>7.4f}  {res_task[m]['MSE']:>8.0f} │ "
+              f"{res_task_rlm[m]['R2']:>7.4f}  {res_task_rlm[m]['MSE']:>8.0f}")
+    print("─" * 102)
 
     # 2. Out-of-Distribution Generalization across Parallelism Configurations
     cv_config = GroupKFold(n_splits=4)
-    res_gen_config_rlm, _ = evaluate_feature_set(df, cols_rlm, cv=cv_config, groups=df["config"])
+    res_gen_config_rlm, _ = evaluate_feature_set(df, cols_task_rlm, cv=cv_config, groups=df["config"])
 
     r2_generalization = {
-        "in_dist": res_rlm,
+        "in_dist": res_task_rlm,
         "group_config": res_gen_config_rlm,
     }
 
@@ -233,7 +239,7 @@ def main():
     print(f"{'Evaluation Split':<40} │ {'Linear Reg':^14} │ {'Random Forest':^15} │ {'Gradient Boost':^15}")
     print(f"{'':<40} │ {'R²':>6}   {'MSE':>6} │ {'R²':>6}    {'MSE':>6} │ {'R²':>6}    {'MSE':>6}")
     print("─" * 88)
-    print(f"{'In-Distribution (Random 3-Fold)':<40} │ {res_rlm['Linear Regression']['R2']:>6.4f} {res_rlm['Linear Regression']['MSE']:>6.0f} │ {res_rlm['Random Forest']['R2']:>6.4f}  {res_rlm['Random Forest']['MSE']:>6.0f} │ {res_rlm['Gradient Boosting']['R2']:>6.4f}  {res_rlm['Gradient Boosting']['MSE']:>6.0f}")
+    print(f"{'In-Distribution (Random 3-Fold)':<40} │ {res_task_rlm['Linear Regression']['R2']:>6.4f} {res_task_rlm['Linear Regression']['MSE']:>6.0f} │ {res_task_rlm['Random Forest']['R2']:>6.4f}  {res_task_rlm['Random Forest']['MSE']:>6.0f} │ {res_task_rlm['Gradient Boosting']['R2']:>6.4f}  {res_task_rlm['Gradient Boosting']['MSE']:>6.0f}")
     print(f"{'GroupKFold: Unseen Parallelism Config':<40} │ {res_gen_config_rlm['Linear Regression']['R2']:>6.4f} {res_gen_config_rlm['Linear Regression']['MSE']:>6.0f} │ {res_gen_config_rlm['Random Forest']['R2']:>6.4f}  {res_gen_config_rlm['Random Forest']['MSE']:>6.0f} │ {res_gen_config_rlm['Gradient Boosting']['R2']:>6.4f}  {res_gen_config_rlm['Gradient Boosting']['MSE']:>6.0f}")
     print("=" * 88)
 

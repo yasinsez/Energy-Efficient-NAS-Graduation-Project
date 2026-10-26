@@ -50,8 +50,9 @@ While prompt length is known pre-execution, output length is dynamic. As acknowl
     \setlength\itemsep{0.03em}
     \item \textbf{Data Aggregation}: To prevent duplicate data leakage across repeated benchmark trials, the 10 replicate runs per setting are aggregated into unique configuration means ($N=24$ unique configurations for Qwen3-14B) prior to modeling.
     \item \textbf{Feature Collision (Why Base Fails)}: Without a workload indicator, identical launch configurations (\texttt{batch\_size=128, out=500, DP2}) predict both Alpaca ($\approx 54\text{ ms}$) and Longbench ($\approx 452\text{ ms}$). This severe collision causes baseline $R^2$ to collapse ($R^2 < 0$).
+    \item \textbf{Why Base + Analytical RLM Alone Fails}: Providing the analytical Roofline latency directly to launch parameters (\texttt{Base + Analytical RLM}) fails to resolve feature collision ($R^2 < 0$), because without prompt/task context, the hardware ceiling is identical for Alpaca and Longbench under identical batch size and generation budget.
     \item \textbf{Resolving Workloads via Categorical Task}: Providing a categorical task indicator (\texttt{task: Alpaca vs. Longbench}) resolves the collision, allowing tree models to achieve $R^2 \approx 0.63$.
-    \item \textbf{Value of Analytical Roofline}: Following Imai et al., analytical Roofline latency is modeled strictly from hardware ceilings, batch size, and generation length without artificial prompt token assumptions. When combined with workload classification, it provides physical inductive bias that reduces mean squared error on tree ensembles by up to 18.2\% (GB MSE drops from $109313 \to 89363$, RF MSE to $92138$), while maintaining robust out-of-distribution generalization across unseen parallelism configurations (GroupKFold $R^2 \approx 0.51$).
+    \item \textbf{Value of Task + Analytical Roofline}: When combined with workload classification, analytical Roofline latency provides physical inductive bias that reduces mean squared error on tree ensembles by up to 18.2\% (GB MSE drops from $109313 \to 89363$, RF MSE to $92138$), while maintaining robust out-of-distribution generalization across unseen parallelism configurations (GroupKFold $R^2 \approx 0.51$).
 \end{itemize}
 
 \vspace{-0.8em}
@@ -59,17 +60,17 @@ While prompt length is known pre-execution, output length is dynamic. As acknowl
 \centering
 \scriptsize
 \renewcommand{\arraystretch}{0.85}
-\setlength{\tabcolsep}{4.0pt}
+\setlength{\tabcolsep}{3.5pt}
 \caption{Qwen3-14B: Feature Set Ablation on Unique Configuration Means ($R^2$ / MSE). \\
 \textit{Evaluated on 24 aggregated configuration cells via 3-Fold Cross-Validation. Base features: \texttt{[tp, pp, dp, num\_gpus, batch\_size, output\_tokens]}.}}
 \label{tab:takeaway}
-\begin{tabular}{l ccc c}
+\begin{tabular}{l cccc}
 \toprule
-\textbf{Model / Estimator} & \textbf{Base (Collision)} & \textbf{Base + Categorical Task} & \textbf{Task + Analytical RLM} & \textbf{Key Takeaway} \\
+\textbf{Model / Estimator} & \textbf{Base (Collision)} & \textbf{Base + Analytical RLM} & \textbf{Base + Task} & \textbf{Task + Analytical RLM} \\
 \midrule
-Linear Regression (LR)          & -0.9465 / 373347 & \textbf{0.2791 / 140298} & \textbf{0.2791 / 140298} & Task resolves collision \\
-Random Forest (RF)              & -0.7947 / 397206 & 0.6265 / 100881          & \textbf{0.6413 / 92138}  & RLM cuts MSE by 8.7\% \\
-Gradient Boosting (GB)          & -1.5466 / 522026 & 0.5644 / 109313          & \textbf{0.6100 / 89363}  & RLM cuts MSE by 18.2\% \\
+Linear Regression (LR)          & -0.9465 / 373347 & -0.9465 / 373347 & \textbf{0.2791 / 140298} & \textbf{0.2791 / 140298} \\
+Random Forest (RF)              & -0.7947 / 397206 & -0.7822 / 399730 & 0.6265 / 100881          & \textbf{0.6413 / 92138}  \\
+Gradient Boosting (GB)          & -1.5466 / 522026 & -1.5455 / 521479 & 0.5644 / 109313          & \textbf{0.6100 / 89363}  \\
 \midrule
 \multicolumn{5}{l}{\textit{\textbf{Out-of-Distribution Generalization (+Roofline, GroupKFold across Unseen Parallelism)}}} \\
 \multicolumn{5}{l}{Linear Regression: $R^2 = 0.3708$ (MSE $135333$); Random Forest: $R^2 = 0.5148$ (MSE $108194$); Gradient Boosting: $R^2 = 0.4768$ (MSE $113426$)} \\
